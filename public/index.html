@@ -11,10 +11,21 @@
 
     <div class="dashboard-container">
       <canvas id="cpuChart"></canvas>
+
+      <div class="ram-container">
+        <p>Memoria RAM: <span id="ram-text">Cargando...</span></p>
+        <div class="progress-bar">
+          <div id="ram-bar" class="progress-fill"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dashboard-container">
+      <h2>Histórico (Últimas horas)</h2>
+      <canvas id="historyChart"></canvas>
     </div>
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="js/main.js"></script>
   </body>
 </html>
-z

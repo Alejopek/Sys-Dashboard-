@@ -35,6 +35,46 @@ const cpuChart = new Chart(ctx, {
   },
 });
 
+const ctxHistory = document.getElementById("historyChart").getContext("2d");
+const historyChart = new Chart(ctxHistory, {
+  type: "line",
+  data: {
+    labels: [],
+    datasets: [
+      {
+        label: "Promedio CPU (%)",
+        data: [],
+        borderColor: "#00bdff",
+        tension: 0.1,
+        fill: false,
+      },
+      {
+        label: "Promedio RAM (%)",
+        data: [],
+        borderColor: "#ff0088",
+        tension: 0.1,
+        fill: false,
+      },
+    ],
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { labels: { color: "#fff" } } },
+  },
+});
+
+socket.on("history", (data) => {
+  const labels = data.map((row) =>
+    new Date(row.timestamp).toLocaleTimeString(),
+  );
+  const cpuData = data.map((row) => row.cpu);
+  const ramData = data.map((row) => row.ram);
+  historyChart.data.labels = labels;
+  historyChart.data.datasets[0].data = cpuData;
+  historyChart.data.datasets[1].data = ramData;
+  historyChart.update();
+});
+
 socket.on("stats", (data) => {
   const now = new Date().toLocaleTimeString();
 
@@ -47,4 +87,16 @@ socket.on("stats", (data) => {
   }
 
   cpuChart.update();
+
+  const ramPercent = (data.ramUsed / data.ramTotal) * 100;
+  document.getElementById("ram-bar").style.width = `${ramPercent}%`;
+  document.getElementById("ram-text").innerText =
+    `${data.ramUsed}GB / ${data.ramTotal}GB (${ramPercent.toFixed(1)}%)`;
+
+  if (ramPercent > 90) {
+    document.getElementById("ram-bar").style.background = "#ff4a4a";
+  } else {
+    document.getElementById("ram-bar").style.background =
+      "linear-gradient(90deg, #00ff88, #00bdff)";
+  }
 });
