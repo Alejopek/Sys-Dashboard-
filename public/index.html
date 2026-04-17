@@ -9,6 +9,19 @@
   <body>
     <h1>System Dashboard</h1>
 
+    <div class="quick-stats">
+      <div class="card">
+        <h3>Red (Descarga/Subida)</h3>
+        <p>
+          <span id="net-down">0 B/s</span> ↓ / <span id="net-up">0 B/s</span> ↑
+        </p>
+      </div>
+      <div class="card">
+        <h3>Batería</h3>
+        <p><span id="batt-level">--</span>% <span id="batt-status"></span></p>
+      </div>
+    </div>
+
     <div class="dashboard-container">
       <canvas id="cpuChart"></canvas>
 
@@ -24,6 +37,27 @@
       <h2>Histórico (Últimas horas)</h2>
       <canvas id="historyChart"></canvas>
     </div>
+
+    <div class="dashboard-container">
+      <div class="proc-header">
+        <h2>Procesos Principales</h2>
+        <div class="btn-group">
+          <button id="btn-cpu" class="active">Por CPU</button>
+          <button id="btn-mem">Por RAM</button>
+        </div>
+      </div>
+      <table id="proc-table">
+        <thead>
+          <tr>
+            <th>PID</th>
+            <th>Nombre</th>
+            <th id="th-value">CPU %</th>
+          </tr>
+        </thead>
+        <tbody id="proc-body"></tbody>
+      </table>
+    </div>
+
     <script src="/socket.io/socket.io.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="js/main.js"></script>

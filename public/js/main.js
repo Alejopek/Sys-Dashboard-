@@ -75,6 +75,45 @@ socket.on("history", (data) => {
   historyChart.update();
 });
 
+function formatSpeed(bytesPerSec) {
+  if (bytesPerSec === 0) return "0 B/s";
+  const k = 1024;
+  const sizes = ["B/s", "KB/s", "MB/s", "GB/s"];
+  const i = Math.floor(Math.log(bytesPerSec) / Math.log(k));
+  return parseFloat((bytesPerSec / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+}
+
+let currentView = "cpu";
+let lastProcData = { topCpu: [], topMem: [] };
+
+document.getElementById("btn-cpu").onclick = () => switchView("cpu");
+document.getElementById("btn-mem").onclick = () => switchView("mem");
+function switchView(view) {
+  currentView = view;
+  document.getElementById("btn-cpu").classList.toggle("active", view === "cpu");
+  document.getElementById("btn-mem").classList.toggle("active", view === "mem");
+  document.getElementById("th-value").innerText =
+    view === "cpu" ? "CPU %" : "RAM %";
+  updateTable();
+}
+function updateTable() {
+  const tableBody = document.getElementById("proc-body");
+  const data =
+    currentView === "cpu" ? lastProcData.topCpu : lastProcData.topMem;
+
+  tableBody.innerHTML = data
+    .map(
+      (p) => `
+        <tr>
+            <td>${p.pid}</td>
+            <td>${p.name}</td>
+            <td>${currentView === "cpu" ? p.cpu.toFixed(1) : p.mem.toFixed(1)}%</td>
+        </tr>
+    `,
+    )
+    .join("");
+}
+
 socket.on("stats", (data) => {
   const now = new Date().toLocaleTimeString();
 
@@ -99,4 +138,18 @@ socket.on("stats", (data) => {
     document.getElementById("ram-bar").style.background =
       "linear-gradient(90deg, #00ff88, #00bdff)";
   }
+
+  document.getElementById("net-down").innerText = formatSpeed(data.netDownload);
+  document.getElementById("net-up").innerText = formatSpeed(data.netUpload);
+  if (data.batteryPercent !== -1) {
+    document.getElementById("batt-level").innerText = data.batteryPercent;
+    document.getElementById("batt-status").innerText = data.isCharging
+      ? "⚡"
+      : "🔋";
+  } else {
+    document.getElementById("batt-level").innerText = "N/A";
+  }
+  lastProcData.topCpu = data.topCpu;
+  lastProcData.topMem = data.topMem;
+  updateTable();
 });
