@@ -8,3 +8,7 @@ Thumbs.db
 npm-debug.log*
 
 *.sqlite
+
+dist/
+
+.electron-builder/

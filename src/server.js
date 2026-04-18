@@ -12,8 +12,9 @@ const server = http.createServer(app);
 const io = new Server(server);
 
 (async () => {
+  const dbPath = process.env.DATABASE_PATH || "./database.sqlite";
   db = await open({
-    filename: "./database.sqlite",
+    filename: dbPath,
     driver: sqlite3.Database,
   });
   await db.exec(`
@@ -88,3 +89,5 @@ io.on("connection", async (socket) => {
     socket.emit("history", history.reverse());
   }
 });
+
+module.exports = server;

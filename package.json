@@ -2,9 +2,10 @@
   "name": "dashboard",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "electron .",
+    "dist": "electron-builder"
   },
   "keywords": [],
   "author": "",
@@ -16,5 +17,17 @@
     "sqlite": "^5.1.1",
     "sqlite3": "^6.0.1",
     "systeminformation": "^5.31.5"
+  },
+  "devDependencies": {
+    "electron": "^41.2.1",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "productName": "Sys Dashboard",
+    "executableName": "sys-dashboard",
+    "linux": {
+      "category": "System;Monitor",
+      "icon": "build/icon.png"
+    }
   }
 }
