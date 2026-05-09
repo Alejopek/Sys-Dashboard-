@@ -59,10 +59,21 @@ setInterval(async () => {
   }
 }, 1000);
 
-const PORT = 3000;
-server.listen(PORT, () => {
-  console.log(`Servidor corriendo en http://localhost:${PORT}`);
-});
+const PORT = process.env.PORT || 0;
+
+function startServer() {
+  return new Promise((resolve, reject) => {
+    const srv = server.listen(PORT, () => {
+      const address = srv.address();
+      const actualPort = typeof address === "string" ? address : address.port;
+      console.log(`Servidor corriendo en http://localhost:${actualPort}`);
+      resolve(actualPort);
+    });
+    srv.on("error", (err) => {
+      reject(err);
+    });
+  });
+}
 
 setInterval(async () => {
   if (db) {
@@ -90,4 +101,4 @@ io.on("connection", async (socket) => {
   }
 });
 
-module.exports = server;
+module.exports = { startServer };
