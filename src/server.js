@@ -28,7 +28,12 @@ const io = new Server(server);
   console.log("Base de datos lista");
 })();
 
-app.use(express.static(path.join(__dirname, "../public")));
+const publicPath = path.resolve(__dirname, "../public");
+app.use(express.static(publicPath));
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(publicPath, "index.html"));
+});
 
 setInterval(async () => {
   try {
