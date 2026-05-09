@@ -49,9 +49,9 @@ setInterval(async () => {
     console.log("Batería:", battery);
 
     io.emit("stats", {
-      cpu: cpu.currentLoad.toFixed(2),
-      ramUsed: (ram.active / 1024 / 1024 / 1024).toFixed(2),
-      ramTotal: (ram.total / 1024 / 1024 / 1024).toFixed(2),
+      cpu: cpu.currentLoad,
+      ramUsed: (ram.active / 1024 / 1024 / 1024),
+      ramTotal: (ram.total / 1024 / 1024 / 1024),
       netDownload: activeNet.rx_sec || 0,
       netUpload: activeNet.tx_sec || 0,
       batteryPercent: battery.percent,
