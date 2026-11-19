@@ -11,6 +11,7 @@ const GLASS: Color32 = Color32::from_rgba_unmultiplied_const(10, 18, 27, 142);
 const GLASS_STRONG: Color32 = Color32::from_rgba_unmultiplied_const(10, 16, 23, 205);
 const GLASS_BORDER: Color32 = Color32::from_rgba_unmultiplied_const(225, 240, 245, 96);
 const MUTED: Color32 = Color32::from_rgb(194, 201, 213);
+const TERTIARY: Color32 = Color32::from_rgb(169, 181, 194);
 const TEAL: Color32 = Color32::from_rgb(108, 221, 207);
 const BLUE: Color32 = Color32::from_rgb(111, 178, 255);
 const PURPLE: Color32 = Color32::from_rgb(189, 149, 255);
@@ -75,12 +76,14 @@ struct App {
     db: Connection,
     sample: Sample,
     cpu_history: VecDeque<f32>,
+    memory_history: VecDeque<(f32, f32)>,
     history: Vec<(f32, f32)>,
     last_tick: Instant,
     last_saved: Instant,
     memory_view: bool,
     error: Option<String>,
     page: Page,
+    sidebar_collapsed: bool,
     cpu_history_detail: VecDeque<f32>,
     gpu_history: VecDeque<f32>,
     download_history: VecDeque<f32>,
@@ -190,12 +193,14 @@ impl App {
                 up: 0,
             },
             cpu_history: VecDeque::new(),
+            memory_history: VecDeque::new(),
             history,
             last_tick: Instant::now() - Duration::from_secs(2),
             last_saved: Instant::now(),
             memory_view: false,
             error: None,
             page: Page::General,
+            sidebar_collapsed: false,
             cpu_history_detail: VecDeque::new(),
             gpu_history: VecDeque::new(),
             download_history: VecDeque::new(),
@@ -322,6 +327,11 @@ impl App {
         self.cpu_history.push_back(cpu);
         self.cpu_history_detail.push_back(cpu);
         self.gpu_history.push_back(gpu_usage);
+        self.memory_history
+            .push_back((used as f32, self.system.used_swap() as f32 / 1_073_741_824.));
+        if self.memory_history.len() > 120 {
+            self.memory_history.pop_front();
+        }
         if self.cpu_history.len() > 60 {
             self.cpu_history.pop_front();
         }
@@ -357,6 +367,7 @@ impl App {
     fn render_page(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| match self.page {
                 Page::Cpu => self.cpu_page(ui),
                 Page::Memory => self.memory_page(ui),
@@ -673,7 +684,14 @@ impl App {
                                             .color(MUTED)
                                             .size(12.),
                                     );
-                                    card.add_space(8.);
+                                    card.add_space(6.);
+                                    card.label(
+                                        egui::RichText::new(format!("{:.0}% usado", pct * 100.))
+                                            .size(12.)
+                                            .strong()
+                                            .color(TERTIARY),
+                                    );
+                                    card.add_space(3.);
                                     card.add(
                                         egui::ProgressBar::new(pct)
                                             .fill(if pct > 0.9 {
@@ -681,14 +699,14 @@ impl App {
                                             } else {
                                                 BLUE
                                             })
-                                            .text(format!("{:.0}% usado", pct * 100.))
-                                            .desired_height(12.),
+                                            .desired_height(18.),
                                     );
                                     card.add_space(5.);
                                     card.horizontal(|card| {
                                         card.label(
                                             egui::RichText::new(format!("{} usados", bytes(used)))
-                                                .size(11.),
+                                                .size(12.)
+                                                .color(TERTIARY),
                                         );
                                         card.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -698,7 +716,8 @@ impl App {
                                                         "{} libres",
                                                         bytes(available)
                                                     ))
-                                                    .size(11.),
+                                                    .size(12.)
+                                                    .color(TERTIARY),
                                                 );
                                             },
                                         );
@@ -709,6 +728,18 @@ impl App {
                 }
             });
         });
+        ui.add_space(14.);
+        panel_icon(ui, "Historial de RAM", Icon::Memory, BLUE, |ui| {
+            memory_chart(ui, &self.memory_history, false);
+        });
+        ui.add_space(12.);
+        panel_icon(
+            ui,
+            "Historial de Swap",
+            Icon::Memory,
+            Color32::from_rgb(255, 184, 94),
+            |ui| memory_chart(ui, &self.memory_history, true),
+        );
     }
 
     fn network_page(&mut self, ui: &mut egui::Ui) {
@@ -973,40 +1004,71 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(200));
         let viewport = ui.max_rect();
         paint_wallpaper(ui, &self.wallpaper);
+        let sidebar_width = ctx.animate_value_with_time(
+            egui::Id::NULL.with(egui::IdSalt::new("sidebar-width")),
+            if self.sidebar_collapsed { 76. } else { 210. },
+            0.22,
+        );
+        let sidebar_compact = sidebar_width < 150.;
         egui::Panel::left("sidebar")
-            .size_range(210.0..=210.0)
+            .size_range(sidebar_width..=sidebar_width)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::NONE)
-                    .inner_margin(16.),
+                    .inner_margin(if sidebar_compact { 8. } else { 16. }),
             )
             .show(ui, |ui| {
                 paint_glass_surface(
                     ui,
-                    Rect::from_min_size(viewport.min, Vec2::new(210., viewport.height())),
+                    Rect::from_min_size(viewport.min, Vec2::new(sidebar_width, viewport.height())),
                     22.,
                 );
                 ui.add_space(12.);
                 ui.horizontal(|ui| {
-                    icon(ui, Icon::Dashboard, TEAL, 26.);
-                    ui.label(
-                        egui::RichText::new("SysDash")
-                            .color(Color32::WHITE)
-                            .size(21.)
-                            .strong(),
-                    );
+                    if !sidebar_compact {
+                        icon(ui, Icon::Dashboard, TEAL, 26.);
+                        ui.label(
+                            egui::RichText::new("SysDash")
+                                .color(Color32::WHITE)
+                                .size(21.)
+                                .strong(),
+                        );
+                    } else {
+                        icon(ui, Icon::Dashboard, TEAL, 22.);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let chevron = if self.sidebar_collapsed { "›" } else { "‹" };
+                        if ui
+                            .add_sized(
+                                Vec2::splat(28.),
+                                egui::Button::new(egui::RichText::new(chevron).size(20.))
+                                    .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 18))
+                                    .stroke(Stroke::new(
+                                        1.,
+                                        Color32::from_rgba_unmultiplied(225, 240, 245, 44),
+                                    ))
+                                    .corner_radius(9.),
+                            )
+                            .clicked()
+                        {
+                            self.sidebar_collapsed = !self.sidebar_collapsed;
+                        }
+                    });
                 });
-                ui.add_space(26.);
+                ui.add_space(if sidebar_compact { 14. } else { 26. });
                 ui.separator();
                 ui.add_space(14.);
-                ui.label(
-                    egui::RichText::new("MONITOR")
-                        .color(MUTED)
-                        .size(10.)
-                        .strong(),
-                );
-                ui.add_space(6.);
+                if !sidebar_compact {
+                    ui.label(
+                        egui::RichText::new("MONITOR")
+                            .color(MUTED)
+                            .size(10.)
+                            .strong(),
+                    );
+                    ui.add_space(6.);
+                }
                 for (kind, label) in [
                     (Icon::Dashboard, "General"),
                     (Icon::Cpu, "CPU"),
@@ -1037,31 +1099,43 @@ impl eframe::App for App {
                         );
                     }
                     let icon_color = if selected { TEAL } else { MUTED };
-                    let icon_rect =
-                        Rect::from_min_size(rect.min + Vec2::new(11., 10.), Vec2::splat(17.));
-                    paint_icon(ui, kind, icon_color, icon_rect);
-                    ui.painter().text(
-                        rect.min + Vec2::new(40., rect.height() * 0.5),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        egui::FontId::proportional(15.),
-                        if selected { TEAL } else { MUTED },
+                    let icon_x = if sidebar_compact {
+                        rect.center().x - 8.5
+                    } else {
+                        rect.min.x + 11.
+                    };
+                    let icon_rect = Rect::from_min_size(
+                        Pos2::new(icon_x, rect.center().y - 8.5),
+                        Vec2::splat(17.),
                     );
-                    if response
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
+                    paint_icon(ui, kind, icon_color, icon_rect);
+                    if !sidebar_compact {
+                        ui.painter().text(
+                            rect.min + Vec2::new(40., rect.height() * 0.5),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(15.),
+                            if selected { TEAL } else { MUTED },
+                        );
+                    }
+                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if sidebar_compact {
+                        response.clone().on_hover_text(label);
+                    }
+                    if response.clicked() {
                         self.page = page;
                     }
                 }
-                ui.add_space(16.);
-                ui.label(
-                    egui::RichText::new("SISTEMA")
-                        .color(MUTED)
-                        .size(10.)
-                        .strong(),
-                );
-                ui.add_space(8.);
+                if !sidebar_compact {
+                    ui.add_space(16.);
+                    ui.label(
+                        egui::RichText::new("SISTEMA")
+                            .color(MUTED)
+                            .size(10.)
+                            .strong(),
+                    );
+                    ui.add_space(8.);
+                }
                 let (rect, processes) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), 38.),
                     egui::Sense::click(),
@@ -1085,19 +1159,32 @@ impl eframe::App for App {
                     } else {
                         MUTED
                     },
-                    Rect::from_min_size(rect.min + Vec2::new(11., 10.), Vec2::splat(17.)),
+                    Rect::from_min_size(
+                        Pos2::new(
+                            if sidebar_compact {
+                                rect.center().x - 8.5
+                            } else {
+                                rect.min.x + 11.
+                            },
+                            rect.center().y - 8.5,
+                        ),
+                        Vec2::splat(17.),
+                    ),
                 );
-                ui.painter().text(
-                    rect.min + Vec2::new(40., rect.height() * 0.5),
-                    egui::Align2::LEFT_CENTER,
-                    "Procesos",
-                    egui::FontId::proportional(15.),
-                    MUTED,
-                );
-                if processes
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
+                if !sidebar_compact {
+                    ui.painter().text(
+                        rect.min + Vec2::new(40., rect.height() * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        "Procesos",
+                        egui::FontId::proportional(15.),
+                        MUTED,
+                    );
+                }
+                let processes = processes.on_hover_cursor(egui::CursorIcon::PointingHand);
+                if sidebar_compact {
+                    processes.clone().on_hover_text("Procesos");
+                }
+                if processes.clicked() {
                     self.page = Page::Processes;
                 }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -1105,8 +1192,10 @@ impl eframe::App for App {
                         let p = ui.painter();
                         let c = ui.cursor().center();
                         p.circle_filled(c, 4., TEAL);
-                        ui.add_space(10.);
-                        ui.label(egui::RichText::new("Conectado").color(MUTED).size(11.));
+                        if !sidebar_compact {
+                            ui.add_space(10.);
+                            ui.label(egui::RichText::new("Conectado").color(MUTED).size(11.));
+                        }
                     });
                 });
             });
@@ -1115,6 +1204,7 @@ impl eframe::App for App {
             .frame(
                 egui::Frame::new()
                     .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
                     .inner_margin(24.),
             )
             .show(ui, |ui| {
@@ -1124,6 +1214,7 @@ impl eframe::App for App {
                 }
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
@@ -2493,6 +2584,7 @@ fn ping_stats() -> (Option<f32>, Option<f32>) {
 enum ChartUnits {
     Percent,
     Bytes,
+    Memory,
 }
 
 fn chart(ui: &mut egui::Ui, data: &VecDeque<f32>, color: Color32) {
@@ -2523,6 +2615,21 @@ fn process_history_chart(ui: &mut egui::Ui, data: &VecDeque<(f32, f32)>) {
         1,
         ChartUnits::Percent,
     );
+}
+
+fn memory_chart(ui: &mut egui::Ui, data: &VecDeque<(f32, f32)>, swap: bool) {
+    let label = if swap { "Swap" } else { "RAM" };
+    let color = if swap {
+        Color32::from_rgb(255, 184, 94)
+    } else {
+        BLUE
+    };
+    let values: Vec<_> = data
+        .iter()
+        .map(|sample| if swap { sample.1 } else { sample.0 })
+        .collect();
+    let max = values.iter().copied().fold(1., f32::max) * 1.08;
+    draw_chart(ui, &[(label, &values, color)], max, 1, ChartUnits::Memory);
 }
 
 fn draw_chart(
@@ -2560,6 +2667,7 @@ fn draw_chart(
         let label = match units {
             ChartUnits::Percent => format!("{:.0}%", y_max * ratio),
             ChartUnits::Bytes => speed((y_max * ratio).max(0.) as u64),
+            ChartUnits::Memory => format!("{:.1} GB", y_max * ratio),
         };
         painter.text(
             Pos2::new(plot.left() - 8., y),
@@ -2690,6 +2798,7 @@ fn draw_chart(
                     let label = match units {
                         ChartUnits::Percent => format!("{value:.2}%"),
                         ChartUnits::Bytes => speed(value.max(0.) as u64),
+                        ChartUnits::Memory => format!("{value:.2} GB"),
                     };
                     ui.colored_label(color, format!("{name}: {label}"));
                 }
