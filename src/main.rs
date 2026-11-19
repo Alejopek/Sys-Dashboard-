@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, TextureHandle, Vec2};
 use rusqlite::{Connection, params};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
@@ -91,6 +91,8 @@ struct App {
     process_filter: String,
     selected_process: Option<u32>,
     process_drawer_open: bool,
+    drawer_opened_at: Option<Instant>,
+    process_history: HashMap<u32, VecDeque<(f32, f32)>>,
     gpu_samples: Vec<GpuSample>,
     ping_ms: Option<f32>,
     jitter_ms: Option<f32>,
@@ -204,6 +206,8 @@ impl App {
             process_filter: String::new(),
             selected_process: None,
             process_drawer_open: false,
+            drawer_opened_at: None,
+            process_history: HashMap::new(),
             gpu_samples: vec![],
             ping_ms: None,
             jitter_ms: None,
@@ -273,6 +277,21 @@ impl App {
                 }
             })
             .collect();
+        let active_pids: HashSet<_> = self
+            .process_rows
+            .iter()
+            .map(|process| process.pid)
+            .collect();
+        let total_memory = self.system.total_memory().max(1) as f32;
+        for process in &self.process_rows {
+            let history = self.process_history.entry(process.pid).or_default();
+            history.push_back((process.cpu, process.memory as f32 * 100. / total_memory));
+            if history.len() > 120 {
+                history.pop_front();
+            }
+        }
+        self.process_history
+            .retain(|pid, _| active_pids.contains(pid));
         self.gpu_samples = self
             .gpus
             .iter()
@@ -930,6 +949,7 @@ impl App {
                 ) {
                     self.selected_process = Some(row.pid);
                     self.process_drawer_open = true;
+                    self.drawer_opened_at = Some(Instant::now());
                 }
             }
         });
@@ -939,7 +959,14 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.last_tick.elapsed() >= Duration::from_secs(1) {
+        let drawer_age = self
+            .drawer_opened_at
+            .map(|opened| opened.elapsed())
+            .unwrap_or_default();
+        let refresh_interval = Duration::from_secs(1);
+        if self.last_tick.elapsed() >= refresh_interval
+            && (!self.process_drawer_open || drawer_age >= Duration::from_millis(1_150))
+        {
             self.refresh();
             self.last_tick = Instant::now();
         }
@@ -1314,17 +1341,24 @@ impl eframe::App for App {
                                 ) {
                                     self.selected_process = Some(row.pid);
                                     self.process_drawer_open = true;
+                                    self.drawer_opened_at = Some(Instant::now());
                                 }
                             }
-                            if ui
-                                .add(
-                                    egui::Button::new("Ver todos los procesos →")
-                                        .corner_radius(12.),
-                                )
-                                .clicked()
-                            {
-                                self.page = Page::Processes;
-                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if icon_action_button(
+                                        ui,
+                                        "Ver todos los procesos",
+                                        Icon::Processes,
+                                        BLUE,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.page = Page::Processes;
+                                    }
+                                },
+                            );
                         });
                         if let Some(err) = &self.error {
                             ui.colored_label(Color32::LIGHT_RED, format!("SQLite: {err}"));
@@ -1339,7 +1373,33 @@ impl App {
     fn draw_process_drawer(&mut self, ctx: &egui::Context, viewport: Rect) {
         let backdrop_id = egui::Id::NULL.with(egui::IdSalt::new("process-drawer-backdrop"));
         let drawer_id = egui::Id::NULL.with(egui::IdSalt::new("process-drawer"));
-        let progress = ctx.animate_bool_with_time(drawer_id, self.process_drawer_open, 0.26);
+        let drawer_age = self
+            .drawer_opened_at
+            .map(|opened| opened.elapsed().as_secs_f32())
+            .unwrap_or(1.);
+        let progress = ctx.animate_bool_with_time_and_easing(
+            drawer_id,
+            self.process_drawer_open,
+            0.32,
+            egui::emath::easing::cubic_out,
+        );
+        let stage = |name: &'static str, delay: f32| {
+            ctx.animate_bool_with_time(
+                drawer_id.with(egui::IdSalt::new(name)),
+                self.process_drawer_open && drawer_age >= delay,
+                0.18,
+            )
+        };
+        let title_alpha = stage("process-drawer-title", 0.34);
+        let metrics_alpha = [
+            stage("process-drawer-metrics-1", 0.36),
+            stage("process-drawer-metrics-2", 0.46),
+            stage("process-drawer-metrics-3", 0.56),
+        ];
+        let details_alpha = stage("process-drawer-details", 0.65);
+        let io_alpha = stage("process-drawer-io", 0.75);
+        let chart_alpha = stage("process-drawer-chart", 0.84);
+        let action_alpha = stage("process-drawer-action", 0.94);
         if !self.process_drawer_open && progress <= 0.001 {
             self.selected_process = None;
             return;
@@ -1406,130 +1466,163 @@ impl App {
                         .layout(egui::Layout::top_down(egui::Align::Min))
                         .id_salt(("process-drawer-content", row.pid)),
                 );
-                panel.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(&row.name)
-                                .size(22.)
-                                .strong()
-                                .color(Color32::WHITE),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("Proceso {} · {}", row.pid, row.status))
+                panel.scope(|ui| {
+                    ui.set_opacity(title_alpha);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(&row.name)
+                                    .size(22.)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Proceso {} · {}",
+                                    row.pid, row.status
+                                ))
                                 .size(13.)
                                 .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(egui::RichText::new("×").size(22.))
-                                    .corner_radius(18.)
-                                    .min_size(Vec2::splat(38.)),
-                            )
-                            .clicked()
-                        {
-                            self.process_drawer_open = false;
-                        }
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(egui::RichText::new("×").size(22.))
+                                        .corner_radius(18.)
+                                        .min_size(Vec2::splat(38.)),
+                                )
+                                .clicked()
+                            {
+                                self.process_drawer_open = false;
+                            }
+                        });
                     });
                 });
                 panel.add_space(14.);
-                panel.horizontal(|ui| {
-                    let width = (ui.available_width() - 12.) / 2.;
-                    process_detail_chip(ui, width, "CPU", format!("{:.1}%", row.cpu), TEAL);
-                    ui.add_space(12.);
-                    process_detail_chip(ui, width, "Memoria", compact_bytes(row.memory), BLUE);
-                });
-                panel.horizontal(|ui| {
-                    let width = (ui.available_width() - 12.) / 2.;
-                    process_detail_chip(ui, width, "Hilos", row.threads.to_string(), PURPLE);
-                    ui.add_space(12.);
-                    process_detail_chip(ui, width, "Usuario", row.owner.clone(), MUTED);
-                });
-                panel.horizontal(|ui| {
-                    let width = (ui.available_width() - 12.) / 2.;
-                    process_detail_chip(
-                        ui,
-                        width,
+                let col_width = (inner.width() - 20.) / 2.;
+                let metrics = [
+                    ("CPU", format!("{:.1}%", row.cpu), TEAL),
+                    ("Memoria", compact_bytes(row.memory), BLUE),
+                    ("Hilos", row.threads.to_string(), PURPLE),
+                    ("Usuario", row.owner.clone(), MUTED),
+                    (
                         "Padre",
                         row.parent
                             .map(|pid| pid.to_string())
                             .unwrap_or_else(|| "—".into()),
                         MUTED,
+                    ),
+                    ("Activo", format_duration(row.runtime), MUTED),
+                ];
+                for row_index in 0..3 {
+                    panel.scope(|ui| {
+                        ui.set_opacity(metrics_alpha[row_index]);
+                        ui.horizontal(|ui| {
+                            let (left, right) =
+                                (&metrics[row_index * 2], &metrics[row_index * 2 + 1]);
+                            process_detail_chip(ui, col_width, left.0, left.1.clone(), left.2);
+                            ui.add_space(12.);
+                            process_detail_chip(ui, col_width, right.0, right.1.clone(), right.2);
+                        });
+                    });
+                    panel.add_space(8.);
+                }
+                panel.scope(|ui| {
+                    ui.set_opacity(details_alpha);
+                    ui.separator();
+                    detail_section(
+                        ui,
+                        "Ejecutable",
+                        if row.executable.is_empty() {
+                            "No disponible"
+                        } else {
+                            &row.executable
+                        },
                     );
-                    ui.add_space(12.);
-                    process_detail_chip(ui, width, "Activo", format_duration(row.runtime), MUTED);
+                    detail_section(
+                        ui,
+                        "Comando",
+                        if row.command.is_empty() {
+                            "No disponible"
+                        } else {
+                            &row.command
+                        },
+                    );
                 });
-                panel.add_space(8.);
-                panel.separator();
-                panel.add_space(10.);
-                detail_section(
-                    &mut panel,
-                    "Ejecutable",
-                    if row.executable.is_empty() {
-                        "No disponible"
-                    } else {
-                        &row.executable
-                    },
-                );
-                detail_section(
-                    &mut panel,
-                    "Comando",
-                    if row.command.is_empty() {
-                        "No disponible"
-                    } else {
-                        &row.command
-                    },
-                );
-                panel.add_space(12.);
-                panel.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("Lectura").color(MUTED).size(12.));
-                        ui.label(
-                            egui::RichText::new(bytes(row.read))
-                                .color(Color32::WHITE)
-                                .strong(),
-                        );
+                panel.scope(|ui| {
+                    ui.set_opacity(io_alpha);
+                    ui.add_space(12.);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("Lectura").color(MUTED).size(12.));
+                            ui.label(
+                                egui::RichText::new(bytes(row.read))
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            );
+                        });
+                        ui.add_space(28.);
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("Escritura").color(MUTED).size(12.));
+                            ui.label(
+                                egui::RichText::new(bytes(row.written))
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            );
+                        });
                     });
-                    ui.add_space(28.);
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("Escritura").color(MUTED).size(12.));
-                        ui.label(
-                            egui::RichText::new(bytes(row.written))
-                                .color(Color32::WHITE)
-                                .strong(),
-                        );
-                    });
+                });
+                panel.scope(|ui| {
+                    ui.set_opacity(chart_alpha);
+                    ui.add_space(12.);
+                    ui.label(
+                        egui::RichText::new("Historial de CPU y memoria")
+                            .color(Color32::WHITE)
+                            .size(14.)
+                            .strong(),
+                    );
+                    let history = self.process_history.get(&row.pid);
+                    if let Some(history) = history {
+                        process_history_chart(ui, history);
+                    } else {
+                        ui.label(egui::RichText::new("Recopilando datos…").color(MUTED));
+                    }
                 });
                 panel.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 42.],
-                            egui::Button::new(
-                                egui::RichText::new("Terminar proceso")
-                                    .color(Color32::from_rgb(255, 158, 158))
-                                    .strong(),
+                    ui.scope(|ui| {
+                        ui.set_opacity(action_alpha);
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 42.],
+                                egui::Button::new(
+                                    egui::RichText::new("Terminar proceso")
+                                        .color(Color32::from_rgb(255, 158, 158))
+                                        .strong(),
+                                )
+                                .fill(Color32::from_rgba_unmultiplied(173, 54, 66, 58))
+                                .stroke(Stroke::new(
+                                    1.,
+                                    Color32::from_rgba_unmultiplied(255, 130, 140, 85),
+                                ))
+                                .corner_radius(14.),
                             )
-                            .fill(Color32::from_rgba_unmultiplied(173, 54, 66, 58))
-                            .stroke(Stroke::new(
-                                1.,
-                                Color32::from_rgba_unmultiplied(255, 130, 140, 85),
-                            ))
-                            .corner_radius(14.),
-                        )
-                        .clicked()
-                    {
-                        if let Some(process) =
-                            self.system.process(sysinfo::Pid::from(row.pid as usize))
+                            .clicked()
                         {
-                            if !process.kill() {
-                                self.error =
-                                    Some(format!("No se pudo finalizar el proceso {}", row.pid));
-                            } else {
-                                self.process_drawer_open = false;
+                            if let Some(process) =
+                                self.system.process(sysinfo::Pid::from(row.pid as usize))
+                            {
+                                if !process.kill() {
+                                    self.error = Some(format!(
+                                        "No se pudo finalizar el proceso {}",
+                                        row.pid
+                                    ));
+                                } else {
+                                    self.process_drawer_open = false;
+                                }
                             }
                         }
-                    }
+                    });
                 });
             });
         ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, drawer_id));
@@ -1615,7 +1708,7 @@ fn panel_icon(
 }
 
 fn paint_glass_surface(ui: &egui::Ui, rect: Rect, rounding: f32) {
-    let painter = ui.painter();
+    let painter = ui.painter_at(rect);
     painter.rect_filled(
         rect.expand(5.),
         rounding + 4.,
@@ -1733,6 +1826,42 @@ fn process_table_header(ui: &mut egui::Ui, widths: &[f32], labels: &[&str], righ
         [rect.left_bottom(), rect.right_bottom()],
         Stroke::new(1., Color32::from_rgba_unmultiplied(225, 240, 245, 48)),
     );
+}
+
+fn icon_action_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    kind: Icon,
+    color: Color32,
+) -> egui::Response {
+    let response = ui.add_sized(
+        Vec2::new(218., 40.),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(13.)
+                .strong()
+                .color(Color32::WHITE),
+        )
+        .fill(Color32::from_rgba_unmultiplied(18, 34, 43, 206))
+        .stroke(Stroke::new(
+            1.,
+            Color32::from_rgba_unmultiplied(108, 221, 207, 82),
+        ))
+        .corner_radius(13.),
+    );
+    if response.hovered() {
+        ui.painter().rect_filled(
+            response.rect,
+            13.,
+            Color32::from_rgba_unmultiplied(47, 164, 174, 34),
+        );
+    }
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(response.rect.left() + 24., response.rect.center().y),
+        Vec2::splat(17.),
+    );
+    paint_icon(ui, kind, color, icon_rect);
+    response
 }
 
 fn process_table_row(
@@ -1856,19 +1985,35 @@ fn format_duration(seconds: u64) -> String {
 }
 
 fn process_detail_chip(ui: &mut egui::Ui, width: f32, label: &str, value: String, color: Color32) {
-    egui::Frame::new()
-        .fill(Color32::from_rgba_unmultiplied(245, 250, 255, 22))
-        .stroke(Stroke::new(
-            1.,
-            Color32::from_rgba_unmultiplied(225, 240, 245, 40),
-        ))
-        .corner_radius(14.)
-        .inner_margin(12.)
-        .show(ui, |ui| {
-            ui.set_min_width((width - 26.).max(50.));
-            ui.label(egui::RichText::new(label).color(MUTED).size(11.));
-            ui.label(egui::RichText::new(value).color(color).size(17.).strong());
-        });
+    let size = Vec2::new(width.max(72.), 68.);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let fill = if response.hovered() {
+        Color32::from_rgba_unmultiplied(100, 200, 210, 52)
+    } else {
+        Color32::from_rgba_unmultiplied(245, 250, 255, 28)
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 16., fill);
+    painter.rect_stroke(
+        rect,
+        16.,
+        Stroke::new(1., Color32::from_rgba_unmultiplied(225, 240, 245, 48)),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        Pos2::new(rect.center().x, rect.center().y - 10.),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(11.),
+        MUTED,
+    );
+    painter.text(
+        Pos2::new(rect.center().x, rect.center().y + 12.),
+        egui::Align2::CENTER_CENTER,
+        value,
+        egui::FontId::proportional(17.),
+        color,
+    );
 }
 
 fn detail_section(ui: &mut egui::Ui, title: &str, value: &str) {
@@ -2229,9 +2374,15 @@ fn average(values: &VecDeque<f32>) -> f32 {
     }
 }
 fn chart_scaled(ui: &mut egui::Ui, data: &VecDeque<f32>, color: Color32) {
-    let max = data.iter().copied().fold(1., f32::max);
-    let normalized: VecDeque<f32> = data.iter().map(|value| value * 100. / max).collect();
-    chart(ui, &normalized, color);
+    let values: Vec<_> = data.iter().copied().collect();
+    let max = values.iter().copied().fold(1., f32::max) * 1.08;
+    draw_chart(
+        ui,
+        &[("Tráfico", &values, color)],
+        max,
+        1,
+        ChartUnits::Bytes,
+    );
 }
 fn donut(ui: &mut egui::Ui, fraction: f32, color: Color32, center: String) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(68.), egui::Sense::hover());
@@ -2338,62 +2489,212 @@ fn ping_stats() -> (Option<f32>, Option<f32>) {
     (nums.get(1).copied(), nums.get(3).copied())
 }
 
+#[derive(Clone, Copy)]
+enum ChartUnits {
+    Percent,
+    Bytes,
+}
+
 fn chart(ui: &mut egui::Ui, data: &VecDeque<f32>, color: Color32) {
-    let (r, _) = ui.allocate_exact_size(
-        Vec2::new(
-            ui.available_width(),
-            ui.available_height().clamp(260., 480.),
-        ),
+    let values: Vec<_> = data.iter().copied().collect();
+    let label = if color == PURPLE { "GPU" } else { "CPU" };
+    draw_chart(ui, &[(label, &values, color)], 100., 1, ChartUnits::Percent);
+}
+
+fn history_chart(ui: &mut egui::Ui, data: &[(f32, f32)]) {
+    let cpu: Vec<_> = data.iter().map(|sample| sample.0).collect();
+    let ram: Vec<_> = data.iter().map(|sample| sample.1).collect();
+    draw_chart(
+        ui,
+        &[("CPU", &cpu, BLUE), ("RAM", &ram, PURPLE)],
+        100.,
+        60,
+        ChartUnits::Percent,
+    );
+}
+
+fn process_history_chart(ui: &mut egui::Ui, data: &VecDeque<(f32, f32)>) {
+    let cpu: Vec<_> = data.iter().map(|sample| sample.0).collect();
+    let ram: Vec<_> = data.iter().map(|sample| sample.1).collect();
+    draw_chart(
+        ui,
+        &[("CPU", &cpu, TEAL), ("RAM", &ram, BLUE)],
+        100.,
+        1,
+        ChartUnits::Percent,
+    );
+}
+
+fn draw_chart(
+    ui: &mut egui::Ui,
+    series: &[(&str, &[f32], Color32)],
+    y_max: f32,
+    sample_interval_seconds: u64,
+    units: ChartUnits,
+) {
+    let height = ui.available_height().clamp(220., 360.);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
         egui::Sense::hover(),
     );
-    let p = ui.painter_at(r);
-    p.rect_filled(r, 10., Color32::from_rgba_unmultiplied(4, 8, 16, 82));
-    for i in 1..4 {
-        let y = r.top() + r.height() * i as f32 / 4.;
-        p.line_segment(
-            [Pos2::new(r.left(), y), Pos2::new(r.right(), y)],
-            Stroke::new(1., Color32::from_rgba_unmultiplied(255, 255, 255, 22)),
+    if ui.is_sizing_pass() {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 12., Color32::from_rgba_unmultiplied(4, 8, 16, 108));
+
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left() + 48., rect.top() + 12.),
+        Pos2::new(rect.right() - 12., rect.bottom() - 31.),
+    );
+    for tick in 0..=4 {
+        let ratio = tick as f32 / 4.;
+        let y = plot.bottom() - plot.height() * ratio;
+        painter.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(
+                if tick == 0 { 1.2 } else { 0.8 },
+                Color32::from_rgba_unmultiplied(225, 240, 245, if tick == 0 { 62 } else { 34 }),
+            ),
+        );
+        let label = match units {
+            ChartUnits::Percent => format!("{:.0}%", y_max * ratio),
+            ChartUnits::Bytes => speed((y_max * ratio).max(0.) as u64),
+        };
+        painter.text(
+            Pos2::new(plot.left() - 8., y),
+            egui::Align2::RIGHT_CENTER,
+            label,
+            egui::FontId::proportional(10.),
+            MUTED,
         );
     }
-    if data.len() > 1 {
-        let pts: Vec<_> = data
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                Pos2::new(
-                    r.left() + r.width() * i as f32 / (data.len() - 1) as f32,
-                    r.bottom() - r.height() * v.clamp(0., 100.) / 100.,
-                )
-            })
-            .collect();
-        p.add(egui::Shape::line(pts, Stroke::new(2., color)));
+    for tick in 0..=4 {
+        let ratio = tick as f32 / 4.;
+        let x = plot.left() + plot.width() * ratio;
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(0.7, Color32::from_rgba_unmultiplied(225, 240, 245, 22)),
+        );
     }
-}
-fn history_chart(ui: &mut egui::Ui, data: &[(f32, f32)]) {
-    let (r, _) = ui.allocate_exact_size(
-        Vec2::new(
-            ui.available_width(),
-            ui.available_height().clamp(260., 480.),
-        ),
-        egui::Sense::hover(),
-    );
-    let p = ui.painter_at(r);
-    p.rect_filled(r, 10., Color32::from_rgba_unmultiplied(4, 8, 16, 82));
-    for (idx, color) in [(0, BLUE), (1, PURPLE)] {
-        let pts: Vec<_> = data
+
+    let sample_count = series
+        .iter()
+        .map(|(_, values, _)| values.len())
+        .max()
+        .unwrap_or(0);
+    let mut plotted = Vec::new();
+    for (name, values, color) in series {
+        if values.is_empty() {
+            continue;
+        }
+        let points: Vec<_> = values
             .iter()
             .enumerate()
-            .map(|(i, v)| {
+            .map(|(index, value)| {
+                let x_ratio = index as f32 / values.len().saturating_sub(1).max(1) as f32;
+                let y_ratio = (value / y_max.max(f32::EPSILON)).clamp(0., 1.);
                 Pos2::new(
-                    r.left() + r.width() * i as f32 / (data.len().saturating_sub(1).max(1)) as f32,
-                    r.bottom()
-                        - r.height() * if idx == 0 { v.0 } else { v.1 }.clamp(0., 100.) / 100.,
+                    plot.left() + plot.width() * x_ratio,
+                    plot.bottom() - plot.height() * y_ratio,
                 )
             })
             .collect();
-        if pts.len() > 1 {
-            p.add(egui::Shape::line(pts, Stroke::new(2., color)));
+        let fill = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 68);
+        for pair in points.windows(2) {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    pair[0],
+                    pair[1],
+                    Pos2::new(pair[1].x, plot.bottom()),
+                    Pos2::new(pair[0].x, plot.bottom()),
+                ],
+                fill,
+                Stroke::NONE,
+            ));
         }
+        painter.add(egui::Shape::line(points.clone(), Stroke::new(2., *color)));
+        plotted.push((*name, *values, *color, points));
+    }
+
+    let total_seconds = sample_count.saturating_sub(1) as u64 * sample_interval_seconds;
+    for (ratio, elapsed) in [(0., total_seconds), (0.5, total_seconds / 2), (1., 0)] {
+        let x = plot.left() + plot.width() * ratio;
+        let label = if elapsed == 0 {
+            "Ahora".to_owned()
+        } else if elapsed >= 60 {
+            format!("−{} min", elapsed / 60)
+        } else {
+            format!("−{} s", elapsed)
+        };
+        painter.text(
+            Pos2::new(x, plot.bottom() + 16.),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::proportional(10.),
+            MUTED,
+        );
+    }
+    if plotted.len() > 1 {
+        let legend_y = rect.top() + 3.;
+        let mut legend_x = plot.left();
+        for (name, _, color, _) in &plotted {
+            painter.circle_filled(Pos2::new(legend_x + 4., legend_y + 7.), 3.5, *color);
+            painter.text(
+                Pos2::new(legend_x + 12., legend_y + 7.),
+                egui::Align2::LEFT_CENTER,
+                *name,
+                egui::FontId::proportional(10.),
+                MUTED,
+            );
+            legend_x += 58.;
+        }
+    }
+
+    if let Some(pointer) = response
+        .hover_pos()
+        .filter(|pointer| plot.contains(*pointer))
+    {
+        let x_ratio = ((pointer.x - plot.left()) / plot.width()).clamp(0., 1.);
+        let x = plot.left() + plot.width() * x_ratio;
+        painter.line_segment(
+            [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
+            Stroke::new(1., Color32::from_white_alpha(145)),
+        );
+        let mut selected = Vec::new();
+        for (name, values, color, points) in &plotted {
+            if values.is_empty() {
+                continue;
+            }
+            let index = (x_ratio * values.len().saturating_sub(1) as f32).round() as usize;
+            if let (Some(value), Some(point)) = (values.get(index), points.get(index)) {
+                painter.circle_filled(*point, 5., *color);
+                painter.circle_stroke(*point, 7., Stroke::new(1., Color32::WHITE));
+                selected.push((*name, *value, *color));
+            }
+        }
+        let elapsed = total_seconds.saturating_sub((x_ratio * total_seconds as f32).round() as u64);
+        response.on_hover_ui_at_pointer(|ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(if elapsed == 0 {
+                        "Ahora".to_owned()
+                    } else if elapsed >= 60 {
+                        format!("Hace {} min", elapsed / 60)
+                    } else {
+                        format!("Hace {elapsed} s")
+                    })
+                    .strong(),
+                );
+                for (name, value, color) in selected {
+                    let label = match units {
+                        ChartUnits::Percent => format!("{value:.2}%"),
+                        ChartUnits::Bytes => speed(value.max(0.) as u64),
+                    };
+                    ui.colored_label(color, format!("{name}: {label}"));
+                }
+            });
+        });
     }
 }
 fn speed(n: u64) -> String {
