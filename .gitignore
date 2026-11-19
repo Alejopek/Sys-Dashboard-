@@ -1,15 +1,10 @@
-node_modules/
-
 .env
 
 .DS_Store
 Thumbs.db
 
-npm-debug.log*
-
 *.sqlite
 
 dist/
 
-.electron-builder/
 /target/
