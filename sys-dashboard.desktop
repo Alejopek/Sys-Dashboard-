@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Sys Dashboard
+Comment=Monitor de sistema en tiempo real
+Exec=sys-dashboard
+Icon=utilities-system-monitor
+Type=Application
+Terminal=false
+Categories=System;Monitor;

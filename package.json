@@ -1,33 +1,14 @@
 {
   "name": "dashboard",
-  "version": "1.0.1",
-  "description": "",
-  "main": "app.js",
+  "version": "1.1.0",
+  "description": "SysDash nativo implementado en Rust",
+  "main": "",
   "scripts": {
-    "start": "electron .",
-    "dist": "electron-builder"
+    "start": "cargo run --release",
+    "build": "cargo build --release"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "express": "^5.2.1",
-    "socket.io": "^4.8.3",
-    "sqlite": "^5.1.1",
-    "sqlite3": "^6.0.1",
-    "systeminformation": "^5.31.5"
-  },
-  "devDependencies": {
-    "electron": "^41.2.1",
-    "electron-builder": "^26.8.1"
-  },
-  "build": {
-    "productName": "Sys Dashboard",
-    "executableName": "sys-dashboard",
-    "linux": {
-      "category": "System;Monitor",
-      "icon": "build/icon.png"
-    }
-  }
+  "type": "commonjs"
 }

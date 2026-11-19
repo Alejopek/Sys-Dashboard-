@@ -1,18 +1,30 @@
 # SysDash
 
-Panel de monitoreo del sistema en tiempo real — CPU, RAM, Red y procesos activos.
+Panel de monitoreo del sistema de escritorio, implementado en Rust. La aplicación se ejecuta de forma nativa en Linux y no inicia Electron, Node.js ni un servidor web.
 
 ![Dashboard Preview](./screenshots/dashboard.png)
 
-## Características
+## Funciones
 
-- Visualización en tiempo real de recursos del sistema.
-- Gráficos dinámicos con Chart.js.
-- Monitoreo de procesos activos.
-- Interfaz moderna y profesional.
+- Uso de CPU y memoria en tiempo real.
+- Tráfico de red por segundo.
+- Procesos principales por CPU o memoria.
+- Gráficas de uso e historial local.
+- Historial persistido en SQLite.
 
-## Instalación
+## Requisitos para compilar
 
-```bash
-yay -S sys-dashboard
+- Rust y Cargo (edition 2024).
+- Dependencias gráficas de egui: OpenGL, X11 o Wayland.
+
+## Compilar y ejecutar
+
+```sh
+cargo run --release
 ```
+
+La base SQLite se guarda en `~/.local/share/sys-dashboard/database.sqlite` (o en el directorio de datos local equivalente del sistema).
+
+## Arch Linux
+
+El paquete `PKGBUILD` compila e instala el ejecutable Rust directamente, sin Node.js ni Electron.
