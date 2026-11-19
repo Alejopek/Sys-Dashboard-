@@ -15,13 +15,6 @@ const TEAL: Color32 = Color32::from_rgb(108, 221, 207);
 const BLUE: Color32 = Color32::from_rgb(111, 178, 255);
 const PURPLE: Color32 = Color32::from_rgb(189, 149, 255);
 
-#[derive(Clone)]
-struct Proc {
-    pid: u32,
-    name: String,
-    cpu: f32,
-    mem: f32,
-}
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     General,
@@ -36,14 +29,19 @@ enum ProcessSort {
     Memory,
     Pid,
     Name,
+    Arguments,
+    Threads,
     Owner,
 }
 #[derive(Clone)]
 struct ProcessRow {
     pid: u32,
     name: String,
+    executable: String,
     command: String,
     owner: String,
+    parent: Option<u32>,
+    threads: usize,
     cpu: f32,
     memory: u64,
     status: String,
@@ -64,8 +62,6 @@ struct Sample {
     ram_total: f64,
     down: u64,
     up: u64,
-    top_cpu: Vec<Proc>,
-    top_mem: Vec<Proc>,
 }
 struct App {
     wallpaper: TextureHandle,
@@ -93,7 +89,8 @@ struct App {
     process_sort: ProcessSort,
     process_descending: bool,
     process_filter: String,
-    expanded_process: Option<u32>,
+    selected_process: Option<u32>,
+    process_drawer_open: bool,
     gpu_samples: Vec<GpuSample>,
     ping_ms: Option<f32>,
     jitter_ms: Option<f32>,
@@ -189,8 +186,6 @@ impl App {
                 ram_total: 0.,
                 down: 0,
                 up: 0,
-                top_cpu: vec![],
-                top_mem: vec![],
             },
             cpu_history: VecDeque::new(),
             history,
@@ -207,7 +202,8 @@ impl App {
             process_sort: ProcessSort::Cpu,
             process_descending: true,
             process_filter: String::new(),
-            expanded_process: None,
+            selected_process: None,
+            process_drawer_open: false,
             gpu_samples: vec![],
             ping_ms: None,
             jitter_ms: None,
@@ -230,6 +226,7 @@ impl App {
         self.components.refresh(true);
         self.users.refresh();
         let cpu = self.system.global_cpu_usage();
+        let cpu_scale = self.system.cpus().len().max(1) as f32;
         let total = self.system.total_memory() as f64 / 1_073_741_824.;
         let used = self.system.used_memory() as f64 / 1_073_741_824.;
         let totals = self.networks.iter().fold((0u64, 0u64), |a, (_, n)| {
@@ -239,25 +236,11 @@ impl App {
         let up = totals.1;
         self.download_history.push_back(down as f32);
         self.upload_history.push_back(up as f32);
-        let mut procs: Vec<Proc> = self
-            .system
-            .processes()
-            .iter()
-            .map(|(pid, p)| Proc {
-                pid: pid.as_u32(),
-                name: p.name().to_string_lossy().into_owned(),
-                cpu: p.cpu_usage(),
-                mem: if self.system.total_memory() > 0 {
-                    p.memory() as f32 * 100. / self.system.total_memory() as f32
-                } else {
-                    0.
-                },
-            })
-            .collect();
         self.process_rows = self
             .system
             .processes()
             .iter()
+            .filter(|(_, process)| process.thread_kind().is_none())
             .map(|(pid, p)| {
                 let io = p.disk_usage();
                 let owner = p
@@ -267,7 +250,11 @@ impl App {
                     .unwrap_or_else(|| "desconocido".into());
                 ProcessRow {
                     pid: pid.as_u32(),
-                    name: p.name().to_string_lossy().into_owned(),
+                    name: process_program(p),
+                    executable: p
+                        .exe()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     command: p
                         .cmd()
                         .iter()
@@ -275,7 +262,9 @@ impl App {
                         .collect::<Vec<_>>()
                         .join(" "),
                     owner,
-                    cpu: p.cpu_usage(),
+                    parent: p.parent().map(|parent| parent.as_u32()),
+                    threads: p.tasks().map(|tasks| tasks.len()).unwrap_or(1).max(1),
+                    cpu: p.cpu_usage() / cpu_scale,
                     memory: p.memory(),
                     status: format!("{:?}", p.status()),
                     read: io.read_bytes,
@@ -304,19 +293,12 @@ impl App {
             .filter_map(|g| g.usage)
             .next()
             .unwrap_or(0.);
-        let mut top_cpu = procs.clone();
-        top_cpu.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
-        top_cpu.truncate(5);
-        procs.sort_by(|a, b| b.mem.total_cmp(&a.mem));
-        procs.truncate(5);
         self.sample = Sample {
             cpu,
             ram_used: used,
             ram_total: total,
             down,
             up,
-            top_cpu,
-            top_mem: procs,
         };
         self.cpu_history.push_back(cpu);
         self.cpu_history_detail.push_back(cpu);
@@ -798,10 +780,11 @@ impl App {
         Self::page_title(
             ui,
             "Procesos",
-            "Filtrá, ordená y expandí una fila para ver los detalles",
+            "Filtrá, ordená y seleccioná un proceso para abrir sus detalles",
         );
-        ui.horizontal(|ui| {
-            ui.add(
+        ui.horizontal_wrapped(|ui| {
+            ui.add_sized(
+                [280., 32.],
                 egui::TextEdit::singleline(&mut self.process_filter)
                     .hint_text("Filtrar por nombre, comando o dueño"),
             );
@@ -809,8 +792,10 @@ impl App {
                 (ProcessSort::Cpu, "CPU"),
                 (ProcessSort::Memory, "RAM"),
                 (ProcessSort::Pid, "PID"),
-                (ProcessSort::Name, "Nombre"),
-                (ProcessSort::Owner, "Dueño"),
+                (ProcessSort::Name, "Programa"),
+                (ProcessSort::Arguments, "Comando"),
+                (ProcessSort::Threads, "Hilos"),
+                (ProcessSort::Owner, "Usuario"),
             ] {
                 let selected = self.process_sort == sort;
                 if ui
@@ -839,8 +824,10 @@ impl App {
                         self.process_descending = !self.process_descending;
                     } else {
                         self.process_sort = sort;
-                        self.process_descending =
-                            matches!(sort, ProcessSort::Cpu | ProcessSort::Memory);
+                        self.process_descending = matches!(
+                            sort,
+                            ProcessSort::Cpu | ProcessSort::Memory | ProcessSort::Threads
+                        );
                     }
                 }
             }
@@ -853,16 +840,27 @@ impl App {
                 filter.is_empty()
                     || p.name.to_lowercase().contains(&filter)
                     || p.command.to_lowercase().contains(&filter)
+                    || p.executable.to_lowercase().contains(&filter)
                     || p.owner.to_lowercase().contains(&filter)
             })
             .cloned()
             .collect();
         rows.sort_by(|a, b| {
             let sort = match self.process_sort {
-                ProcessSort::Cpu => a.cpu.total_cmp(&b.cpu),
-                ProcessSort::Memory => a.memory.cmp(&b.memory),
+                ProcessSort::Cpu => a
+                    .cpu
+                    .total_cmp(&b.cpu)
+                    .then_with(|| a.memory.cmp(&b.memory))
+                    .then_with(|| b.pid.cmp(&a.pid)),
+                ProcessSort::Memory => a
+                    .memory
+                    .cmp(&b.memory)
+                    .then_with(|| a.cpu.total_cmp(&b.cpu))
+                    .then_with(|| b.pid.cmp(&a.pid)),
                 ProcessSort::Pid => a.pid.cmp(&b.pid),
                 ProcessSort::Name => a.name.cmp(&b.name),
+                ProcessSort::Arguments => a.command.cmp(&b.command),
+                ProcessSort::Threads => a.threads.cmp(&b.threads),
                 ProcessSort::Owner => a.owner.cmp(&b.owner),
             };
             if self.process_descending {
@@ -874,177 +872,64 @@ impl App {
         ui.add_space(12.);
         panel_icon(ui, "Procesos activos", Icon::Processes, BLUE, |ui| {
             let table_width = ui.available_width();
-            let widths = [
-                table_width * 0.13,
-                table_width * 0.39,
-                table_width * 0.14,
-                table_width * 0.17,
-                table_width * 0.15,
-            ];
-            let headers = ["PID", "PROCESO", "CPU", "MEMORIA", "PROPIETARIO"];
-            let (header_rect, _) =
-                ui.allocate_exact_size(Vec2::new(table_width, 34.), egui::Sense::hover());
-            let mut x = header_rect.left();
-            for (index, (header, width)) in headers.iter().zip(widths).enumerate() {
-                let cell = Rect::from_min_size(
-                    Pos2::new(x, header_rect.top()),
-                    Vec2::new(width, header_rect.height()),
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} procesos", rows.len()))
+                        .color(MUTED)
+                        .size(12.),
                 );
-                ui.painter().text(
-                    Pos2::new(
-                        if index == 2 || index == 3 {
-                            cell.right() - 14.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(if self.process_descending {
+                            "↓"
                         } else {
-                            cell.left() + 14.
-                        },
-                        cell.center().y,
-                    ),
-                    if index == 2 || index == 3 {
-                        egui::Align2::RIGHT_CENTER
-                    } else {
-                        egui::Align2::LEFT_CENTER
-                    },
-                    *header,
-                    egui::FontId::proportional(13.),
-                    MUTED,
-                );
-                x += width;
-            }
-            ui.painter().line_segment(
-                [header_rect.left_bottom(), header_rect.right_bottom()],
-                Stroke::new(1., Color32::from_rgba_unmultiplied(225, 240, 245, 42)),
-            );
+                            "↑"
+                        })
+                        .color(TEAL)
+                        .size(13.),
+                    );
+                    ui.label(
+                        egui::RichText::new(sort_label(self.process_sort))
+                            .color(MUTED)
+                            .size(12.),
+                    );
+                });
+            });
+            let fractions = [0.08, 0.15, 0.36, 0.08, 0.11, 0.12, 0.10];
+            let widths: Vec<_> = fractions
+                .iter()
+                .map(|fraction| table_width * fraction)
+                .collect();
+            let headers = [
+                "PID", "PROGRAMA", "COMANDO", "HILOS", "USUARIO", "MEMORIA", "CPU",
+            ];
+            let right = [0, 3, 5, 6];
+            process_table_header(ui, &widths, &headers, &right);
             ui.add_space(4.);
             for row in &rows {
-                let expanded = self.expanded_process == Some(row.pid);
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::new(table_width, 52.), egui::Sense::click());
-                let fill = if expanded {
-                    Color32::from_rgba_unmultiplied(92, 218, 200, 34)
-                } else if response.hovered() {
-                    Color32::from_rgba_unmultiplied(225, 245, 250, 24)
-                } else {
-                    Color32::TRANSPARENT
-                };
-                ui.painter().rect_filled(rect, 10., fill);
-                if expanded {
-                    ui.painter().rect_filled(
-                        Rect::from_min_max(
-                            rect.left_top(),
-                            Pos2::new(rect.left() + 3., rect.bottom()),
-                        ),
-                        1.5,
-                        TEAL,
-                    );
-                }
                 let values = [
                     row.pid.to_string(),
                     row.name.clone(),
-                    format!("{:.1} %", row.cpu),
-                    bytes(row.memory),
+                    if row.command.is_empty() {
+                        "—".into()
+                    } else {
+                        row.command.clone()
+                    },
+                    row.threads.to_string(),
                     row.owner.clone(),
+                    compact_bytes(row.memory),
+                    format!("{:.1}%", row.cpu),
                 ];
-                let mut x = rect.left();
-                for (index, (value, width)) in values.iter().zip(widths).enumerate() {
-                    let cell = Rect::from_min_size(
-                        Pos2::new(x + 8., rect.top() + 3.),
-                        Vec2::new((width - 16.).max(0.), rect.height() - 6.),
-                    );
-                    let painter = ui.painter().with_clip_rect(cell);
-                    let numeric = index == 0 || index == 2 || index == 3;
-                    let align = if index == 2 || index == 3 {
-                        egui::Align2::RIGHT_CENTER
-                    } else {
-                        egui::Align2::LEFT_CENTER
-                    };
-                    let x_text = if index == 2 || index == 3 {
-                        cell.right() - 5.
-                    } else {
-                        cell.left() + 5.
-                    };
-                    painter.text(
-                        Pos2::new(x_text, cell.center().y),
-                        align,
-                        value,
-                        if numeric {
-                            egui::FontId::monospace(14.)
-                        } else {
-                            egui::FontId::proportional(14.)
-                        },
-                        match index {
-                            0 => MUTED,
-                            2 => TEAL,
-                            _ => Color32::WHITE,
-                        },
-                    );
-                    x += width;
-                }
-                if response.clicked() {
-                    self.expanded_process = if expanded { None } else { Some(row.pid) };
-                }
-                ui.painter().line_segment(
-                    [rect.left_bottom(), rect.right_bottom()],
-                    Stroke::new(1., Color32::from_rgba_unmultiplied(225, 240, 245, 34)),
-                );
-                let visible = self.expanded_process == Some(row.pid);
-                let animation = ui.ctx().animate_bool_with_time(
-                    ui.scope_id().with(egui::IdSalt::new(("process", row.pid))),
-                    visible,
-                    0.18,
-                );
-                if animation > 0. {
-                    egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(
-                            7,
-                            14,
-                            21,
-                            (animation * 176.) as u8,
-                        ))
-                        .stroke(Stroke::new(
-                            1.,
-                            Color32::from_rgba_unmultiplied(225, 240, 245, 54),
-                        ))
-                        .corner_radius(14.)
-                        .inner_margin(egui::Margin::symmetric(16, 12))
-                        .show(ui, |ui| {
-                            ui.label(egui::RichText::new("Comando").color(MUTED));
-                            ui.monospace(if row.command.is_empty() {
-                                "No disponible"
-                            } else {
-                                &row.command
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label(format!("Estado: {}", row.status));
-                                ui.separator();
-                                ui.label(format!("I/O lectura: {}", bytes(row.read)));
-                                ui.separator();
-                                ui.label(format!("I/O escritura: {}", bytes(row.written)));
-                                ui.separator();
-                                ui.label(format!("Activo: {} s", row.runtime));
-                            });
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new("Terminar proceso")
-                                            .color(Color32::from_rgb(255, 153, 153)),
-                                    )
-                                    .fill(Color32::from_rgba_unmultiplied(173, 54, 66, 54))
-                                    .corner_radius(12.),
-                                )
-                                .clicked()
-                            {
-                                if let Some(process) =
-                                    self.system.process(sysinfo::Pid::from(row.pid as usize))
-                                {
-                                    if !process.kill() {
-                                        self.error = Some(format!(
-                                            "No se pudo finalizar el proceso {}",
-                                            row.pid
-                                        ));
-                                    }
-                                }
-                            }
-                        });
+                if process_table_row(
+                    ui,
+                    &widths,
+                    &values,
+                    &right,
+                    self.selected_process == Some(row.pid),
+                    46.,
+                ) {
+                    self.selected_process = Some(row.pid);
+                    self.process_drawer_open = true;
                 }
             }
         });
@@ -1347,82 +1232,97 @@ impl eframe::App for App {
                         ui.add_space(16.);
                         panel_icon(ui, "Procesos", Icon::Processes, BLUE, |ui| {
                             ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Top 5 activos").color(MUTED).size(10.),
-                                    );
-                                });
+                                ui.label(
+                                    egui::RichText::new("Cinco con mayor consumo")
+                                        .color(MUTED)
+                                        .size(12.),
+                                );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.selectable_value(&mut self.memory_view, true, "RAM");
-                                        ui.selectable_value(&mut self.memory_view, false, "CPU");
+                                        for (memory, label) in [(true, "RAM"), (false, "CPU")] {
+                                            let active = self.memory_view == memory;
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new(label).size(12.),
+                                                    )
+                                                    .selected(active)
+                                                    .fill(if active {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            39, 160, 162, 118,
+                                                        )
+                                                    } else {
+                                                        Color32::from_rgba_unmultiplied(
+                                                            220, 235, 240, 20,
+                                                        )
+                                                    })
+                                                    .corner_radius(12.),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.memory_view = memory;
+                                            }
+                                        }
                                     },
                                 );
                             });
                             ui.add_space(8.);
-                            let list = if self.memory_view {
-                                &self.sample.top_mem
-                            } else {
-                                &self.sample.top_cpu
-                            };
-                            egui::Grid::new("general-process-cards")
-                                .num_columns(5)
-                                .spacing([8., 8.])
-                                .show(ui, |ui| {
-                                    for (index, p) in list.iter().enumerate() {
-                                        let response = egui::Frame::new()
-                                            .fill(Color32::from_rgba_unmultiplied(
-                                                255, 255, 255, 14,
-                                            ))
-                                            .stroke(Stroke::new(1., GLASS_BORDER))
-                                            .corner_radius(10.)
-                                            .inner_margin(10.)
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(150.);
-                                                ui.label(
-                                                    egui::RichText::new(&p.name)
-                                                        .size(14.)
-                                                        .strong()
-                                                        .color(Color32::WHITE),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(format!("PID {}", p.pid))
-                                                        .color(MUTED)
-                                                        .size(11.),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "{:.1}% {}",
-                                                        if self.memory_view {
-                                                            p.mem
-                                                        } else {
-                                                            p.cpu
-                                                        },
-                                                        if self.memory_view {
-                                                            "RAM"
-                                                        } else {
-                                                            "CPU"
-                                                        }
-                                                    ))
-                                                    .color(TEAL)
-                                                    .size(13.)
-                                                    .strong(),
-                                                );
-                                            });
-                                        if response
-                                            .response
-                                            .interact(egui::Sense::click())
-                                            .clicked()
-                                        {
-                                            self.page = Page::Processes;
-                                        }
-                                        if (index + 1) % 5 == 0 {
-                                            ui.end_row();
-                                        }
-                                    }
+                            let mut list: Vec<_> = self.process_rows.iter().collect();
+                            if self.memory_view {
+                                list.sort_by(|a, b| {
+                                    b.memory
+                                        .cmp(&a.memory)
+                                        .then_with(|| b.cpu.total_cmp(&a.cpu))
                                 });
-                            if ui.button("Ver todos los procesos →").clicked() {
+                            } else {
+                                list.sort_by(|a, b| {
+                                    b.cpu
+                                        .total_cmp(&a.cpu)
+                                        .then_with(|| b.memory.cmp(&a.memory))
+                                });
+                            }
+                            list.truncate(5);
+                            let table_width = ui.available_width();
+                            let fractions = [0.11, 0.28, 0.34, 0.14, 0.13];
+                            let widths: Vec<_> = fractions
+                                .iter()
+                                .map(|fraction| table_width * fraction)
+                                .collect();
+                            let headers = ["PID", "PROGRAMA", "COMANDO", "CPU", "MEMORIA"];
+                            let right = [0, 3, 4];
+                            process_table_header(ui, &widths, &headers, &right);
+                            for row in list {
+                                let values = [
+                                    row.pid.to_string(),
+                                    row.name.clone(),
+                                    if row.command.is_empty() {
+                                        "—".into()
+                                    } else {
+                                        row.command.clone()
+                                    },
+                                    format!("{:.1}%", row.cpu),
+                                    compact_bytes(row.memory),
+                                ];
+                                if process_table_row(
+                                    ui,
+                                    &widths,
+                                    &values,
+                                    &right,
+                                    self.selected_process == Some(row.pid),
+                                    42.,
+                                ) {
+                                    self.selected_process = Some(row.pid);
+                                    self.process_drawer_open = true;
+                                }
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new("Ver todos los procesos →")
+                                        .corner_radius(12.),
+                                )
+                                .clicked()
+                            {
                                 self.page = Page::Processes;
                             }
                         });
@@ -1431,6 +1331,208 @@ impl eframe::App for App {
                         }
                     });
             });
+        self.draw_process_drawer(ui.ctx(), viewport);
+    }
+}
+
+impl App {
+    fn draw_process_drawer(&mut self, ctx: &egui::Context, viewport: Rect) {
+        let backdrop_id = egui::Id::NULL.with(egui::IdSalt::new("process-drawer-backdrop"));
+        let drawer_id = egui::Id::NULL.with(egui::IdSalt::new("process-drawer"));
+        let progress = ctx.animate_bool_with_time(drawer_id, self.process_drawer_open, 0.26);
+        if !self.process_drawer_open && progress <= 0.001 {
+            self.selected_process = None;
+            return;
+        }
+        let Some(row) = self
+            .selected_process
+            .and_then(|pid| self.process_rows.iter().find(|row| row.pid == pid))
+            .cloned()
+        else {
+            self.process_drawer_open = false;
+            self.selected_process = None;
+            return;
+        };
+
+        egui::Area::new(backdrop_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(viewport.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_min_size(viewport.size());
+                let (rect, response) =
+                    ui.allocate_exact_size(viewport.size(), egui::Sense::click());
+                let painter = ui.painter_at(rect);
+                if let Some(texture) = GLASS_TEXTURE.with(|texture| texture.borrow().clone()) {
+                    painter.image(
+                        texture.id(),
+                        rect,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)),
+                        Color32::from_white_alpha((progress * 28.) as u8),
+                    );
+                }
+                painter.rect_filled(
+                    rect,
+                    0.,
+                    Color32::from_rgba_unmultiplied(4, 8, 12, (progress * 198.) as u8),
+                );
+                if response.clicked() {
+                    self.process_drawer_open = false;
+                }
+            });
+
+        let drawer_width = (viewport.width() * 0.36)
+            .clamp(410., 520.)
+            .min(viewport.width() - 36.);
+        let drawer_height = (viewport.height() - 36.).max(300.);
+        let drawer_position = Pos2::new(
+            viewport.right() - 18. - drawer_width * progress,
+            viewport.top() + 18.,
+        );
+        egui::Area::new(drawer_id)
+            .order(egui::Order::Foreground)
+            .fixed_pos(drawer_position)
+            .movable(false)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(
+                    Vec2::new(drawer_width, drawer_height),
+                    egui::Sense::hover(),
+                );
+                paint_glass_surface(ui, rect, 26.);
+                let inner = rect.shrink(24.);
+                let mut panel = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(inner)
+                        .layout(egui::Layout::top_down(egui::Align::Min))
+                        .id_salt(("process-drawer-content", row.pid)),
+                );
+                panel.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(&row.name)
+                                .size(22.)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Proceso {} · {}", row.pid, row.status))
+                                .size(13.)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("×").size(22.))
+                                    .corner_radius(18.)
+                                    .min_size(Vec2::splat(38.)),
+                            )
+                            .clicked()
+                        {
+                            self.process_drawer_open = false;
+                        }
+                    });
+                });
+                panel.add_space(14.);
+                panel.horizontal(|ui| {
+                    let width = (ui.available_width() - 12.) / 2.;
+                    process_detail_chip(ui, width, "CPU", format!("{:.1}%", row.cpu), TEAL);
+                    ui.add_space(12.);
+                    process_detail_chip(ui, width, "Memoria", compact_bytes(row.memory), BLUE);
+                });
+                panel.horizontal(|ui| {
+                    let width = (ui.available_width() - 12.) / 2.;
+                    process_detail_chip(ui, width, "Hilos", row.threads.to_string(), PURPLE);
+                    ui.add_space(12.);
+                    process_detail_chip(ui, width, "Usuario", row.owner.clone(), MUTED);
+                });
+                panel.horizontal(|ui| {
+                    let width = (ui.available_width() - 12.) / 2.;
+                    process_detail_chip(
+                        ui,
+                        width,
+                        "Padre",
+                        row.parent
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "—".into()),
+                        MUTED,
+                    );
+                    ui.add_space(12.);
+                    process_detail_chip(ui, width, "Activo", format_duration(row.runtime), MUTED);
+                });
+                panel.add_space(8.);
+                panel.separator();
+                panel.add_space(10.);
+                detail_section(
+                    &mut panel,
+                    "Ejecutable",
+                    if row.executable.is_empty() {
+                        "No disponible"
+                    } else {
+                        &row.executable
+                    },
+                );
+                detail_section(
+                    &mut panel,
+                    "Comando",
+                    if row.command.is_empty() {
+                        "No disponible"
+                    } else {
+                        &row.command
+                    },
+                );
+                panel.add_space(12.);
+                panel.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Lectura").color(MUTED).size(12.));
+                        ui.label(
+                            egui::RichText::new(bytes(row.read))
+                                .color(Color32::WHITE)
+                                .strong(),
+                        );
+                    });
+                    ui.add_space(28.);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Escritura").color(MUTED).size(12.));
+                        ui.label(
+                            egui::RichText::new(bytes(row.written))
+                                .color(Color32::WHITE)
+                                .strong(),
+                        );
+                    });
+                });
+                panel.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 42.],
+                            egui::Button::new(
+                                egui::RichText::new("Terminar proceso")
+                                    .color(Color32::from_rgb(255, 158, 158))
+                                    .strong(),
+                            )
+                            .fill(Color32::from_rgba_unmultiplied(173, 54, 66, 58))
+                            .stroke(Stroke::new(
+                                1.,
+                                Color32::from_rgba_unmultiplied(255, 130, 140, 85),
+                            ))
+                            .corner_radius(14.),
+                        )
+                        .clicked()
+                    {
+                        if let Some(process) =
+                            self.system.process(sysinfo::Pid::from(row.pid as usize))
+                        {
+                            if !process.kill() {
+                                self.error =
+                                    Some(format!("No se pudo finalizar el proceso {}", row.pid));
+                            } else {
+                                self.process_drawer_open = false;
+                            }
+                        }
+                    }
+                });
+            });
+        ctx.move_to_top(egui::LayerId::new(egui::Order::Foreground, drawer_id));
     }
 }
 
@@ -1594,6 +1696,189 @@ fn paint_glass_surface(ui: &egui::Ui, rect: Rect, rounding: f32) {
             Pos2::new(rect.right() - rounding, rect.top() + 1.),
         ],
         Stroke::new(1., Color32::from_rgba_unmultiplied(255, 255, 255, 62)),
+    );
+}
+
+fn process_table_header(ui: &mut egui::Ui, widths: &[f32], labels: &[&str], right: &[usize]) {
+    let width: f32 = widths.iter().sum();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 34.), egui::Sense::hover());
+    let mut x = rect.left();
+    for (index, (label, cell_width)) in labels.iter().zip(widths).enumerate() {
+        let cell = Rect::from_min_size(
+            Pos2::new(x + 8., rect.top()),
+            Vec2::new((cell_width - 16.).max(1.), rect.height()),
+        );
+        let is_right = right.contains(&index);
+        ui.painter().with_clip_rect(cell).text(
+            Pos2::new(
+                if is_right {
+                    cell.right() - 4.
+                } else {
+                    cell.left() + 4.
+                },
+                cell.center().y,
+            ),
+            if is_right {
+                egui::Align2::RIGHT_CENTER
+            } else {
+                egui::Align2::LEFT_CENTER
+            },
+            *label,
+            egui::FontId::proportional(12.),
+            MUTED,
+        );
+        x += cell_width;
+    }
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1., Color32::from_rgba_unmultiplied(225, 240, 245, 48)),
+    );
+}
+
+fn process_table_row(
+    ui: &mut egui::Ui,
+    widths: &[f32],
+    values: &[String],
+    right: &[usize],
+    selected: bool,
+    height: f32,
+) -> bool {
+    let width: f32 = widths.iter().sum();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click());
+    let fill = if selected {
+        Color32::from_rgba_unmultiplied(85, 207, 194, 34)
+    } else if response.hovered() {
+        Color32::from_rgba_unmultiplied(225, 245, 250, 24)
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 10., fill);
+    if selected {
+        ui.painter().rect_filled(
+            Rect::from_min_max(rect.left_top(), Pos2::new(rect.left() + 3., rect.bottom())),
+            1.5,
+            TEAL,
+        );
+    }
+    let mut x = rect.left();
+    for (index, (value, cell_width)) in values.iter().zip(widths).enumerate() {
+        let cell = Rect::from_min_size(
+            Pos2::new(x + 8., rect.top() + 3.),
+            Vec2::new((cell_width - 16.).max(1.), rect.height() - 6.),
+        );
+        let is_right = right.contains(&index);
+        let is_numeric = index == 0 || is_right;
+        ui.painter().with_clip_rect(cell).text(
+            Pos2::new(
+                if is_right {
+                    cell.right() - 5.
+                } else {
+                    cell.left() + 5.
+                },
+                cell.center().y,
+            ),
+            if is_right {
+                egui::Align2::RIGHT_CENTER
+            } else {
+                egui::Align2::LEFT_CENTER
+            },
+            value,
+            if is_numeric {
+                egui::FontId::monospace(14.)
+            } else {
+                egui::FontId::proportional(14.)
+            },
+            if index == 0 {
+                MUTED
+            } else if value.ends_with('%') {
+                TEAL
+            } else {
+                Color32::WHITE
+            },
+        );
+        x += cell_width;
+    }
+    ui.painter().line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1., Color32::from_rgba_unmultiplied(225, 240, 245, 34)),
+    );
+    response.clicked()
+}
+
+fn sort_label(sort: ProcessSort) -> &'static str {
+    match sort {
+        ProcessSort::Cpu => "CPU total",
+        ProcessSort::Memory => "Memoria",
+        ProcessSort::Pid => "PID",
+        ProcessSort::Name => "Programa",
+        ProcessSort::Arguments => "Comando",
+        ProcessSort::Threads => "Hilos",
+        ProcessSort::Owner => "Usuario",
+    }
+}
+
+fn process_program(process: &sysinfo::Process) -> String {
+    let name = process.name().to_string_lossy().trim().to_owned();
+    if !name.is_empty() {
+        return name;
+    }
+    process
+        .exe()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "proceso desconocido".into())
+}
+
+fn compact_bytes(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let units = ["B", "K", "M", "G", "T"];
+    let mut unit = 0;
+    while value >= 1024. && unit < units.len() - 1 {
+        value /= 1024.;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0}{}", units[unit])
+    } else {
+        format!("{value:.2}{}", units[unit])
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds / 3_600) % 24;
+    let minutes = (seconds / 60) % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}h {minutes:02}m")
+    } else {
+        format!("{hours:02}h {minutes:02}m")
+    }
+}
+
+fn process_detail_chip(ui: &mut egui::Ui, width: f32, label: &str, value: String, color: Color32) {
+    egui::Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(245, 250, 255, 22))
+        .stroke(Stroke::new(
+            1.,
+            Color32::from_rgba_unmultiplied(225, 240, 245, 40),
+        ))
+        .corner_radius(14.)
+        .inner_margin(12.)
+        .show(ui, |ui| {
+            ui.set_min_width((width - 26.).max(50.));
+            ui.label(egui::RichText::new(label).color(MUTED).size(11.));
+            ui.label(egui::RichText::new(value).color(color).size(17.).strong());
+        });
+}
+
+fn detail_section(ui: &mut egui::Ui, title: &str, value: &str) {
+    ui.add_space(6.);
+    ui.label(egui::RichText::new(title).color(MUTED).size(12.));
+    ui.label(
+        egui::RichText::new(value)
+            .monospace()
+            .color(Color32::WHITE)
+            .size(12.),
     );
 }
 fn metric(ui: &mut egui::Ui, title: &str, value: String, pct: f32, color: Color32) {
