@@ -1,22 +1,142 @@
-use eframe::egui::{self, Color32, Pos2, Rect, Stroke, TextureHandle, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 use rusqlite::{Connection, params};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::mpsc::{self, Receiver},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use sysinfo::{Components, Disks, Gpus, Networks, System, Users};
 
-const PRIMARY: Color32 = Color32::from_rgb(29, 32, 33);
-const SECONDARY: Color32 = Color32::from_rgb(176, 162, 123);
-const TERTIARY: Color32 = Color32::from_rgb(118, 173, 188);
-const GLASS: Color32 = Color32::from_rgba_unmultiplied_const(29, 32, 33, 174);
-const GLASS_STRONG: Color32 = Color32::from_rgba_unmultiplied_const(29, 32, 33, 222);
-const GLASS_BORDER: Color32 = Color32::from_rgba_unmultiplied_const(176, 162, 123, 82);
-const MUTED: Color32 = Color32::from_rgba_unmultiplied_const(176, 162, 123, 178);
-const TEAL: Color32 = SECONDARY;
-const BLUE: Color32 = SECONDARY;
-const PURPLE: Color32 = SECONDARY;
+#[derive(Clone, Copy)]
+struct Palette {
+    primary: Color32,
+    secondary: Color32,
+    tertiary: Color32,
+}
+
+impl Palette {
+    const FALLBACK: Self = Self {
+        primary: Color32::from_rgb(29, 32, 33),
+        secondary: Color32::from_rgb(176, 162, 123),
+        tertiary: Color32::from_rgb(118, 173, 188),
+    };
+}
+
+thread_local! {
+    static ACTIVE_PALETTE: std::cell::Cell<Palette> = const { std::cell::Cell::new(Palette::FALLBACK) };
+}
+
+fn palette() -> Palette {
+    ACTIVE_PALETTE.with(std::cell::Cell::get)
+}
+fn primary() -> Color32 {
+    palette().primary
+}
+fn secondary() -> Color32 {
+    palette().secondary
+}
+fn tertiary() -> Color32 {
+    palette().tertiary
+}
+fn with_alpha(color: Color32, alpha: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+fn glass() -> Color32 {
+    with_alpha(primary(), 174)
+}
+fn glass_strong() -> Color32 {
+    with_alpha(primary(), 222)
+}
+fn glass_border() -> Color32 {
+    with_alpha(secondary(), 82)
+}
+fn muted() -> Color32 {
+    with_alpha(secondary(), 178)
+}
+fn teal() -> Color32 {
+    secondary()
+}
+fn blue() -> Color32 {
+    secondary()
+}
+fn purple() -> Color32 {
+    secondary()
+}
+
+fn install_palette(next: Palette) {
+    ACTIVE_PALETTE.with(|active| active.set(next));
+}
+
+fn system_scheme_path() -> Option<std::path::PathBuf> {
+    let config = dirs::config_dir()?.join("hypr");
+    let lua_config = config.join("hyprland.lua").is_file();
+    let extension = if lua_config { "lua" } else { "conf" };
+    Some(config.join("scheme").join(format!("current.{extension}")))
+}
+
+fn parse_system_palette(path: &std::path::Path) -> Option<Palette> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut colors = HashMap::<&str, Color32>::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.strip_prefix('$').unwrap_or(line).split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_end_matches(',')
+            .trim()
+            .trim_matches('"')
+            .trim_start_matches('#');
+        if value.len() != 6 {
+            continue;
+        }
+        let Ok(rgb) = u32::from_str_radix(value, 16) else {
+            continue;
+        };
+        colors.insert(
+            key.trim(),
+            Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8),
+        );
+    }
+    Some(Palette {
+        primary: *colors.get("surface")?,
+        secondary: *colors.get("onSurface")?,
+        tertiary: *colors.get("primary")?,
+    })
+}
+
+fn apply_egui_palette(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    let accent = tertiary();
+    let foreground = secondary();
+    let border = glass_border();
+    visuals.override_text_color = Some(foreground);
+    visuals.weak_text_color = Some(muted());
+    visuals.hyperlink_color = accent;
+    visuals.selection.bg_fill = with_alpha(accent, 70);
+    visuals.selection.stroke.color = foreground;
+    visuals.panel_fill = primary();
+    visuals.window_fill = glass_strong();
+    visuals.window_stroke.color = border;
+    visuals.extreme_bg_color = primary();
+    visuals.faint_bg_color = with_alpha(secondary(), 20);
+    visuals.code_bg_color = glass();
+    visuals.text_edit_bg_color = Some(glass_strong());
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.fg_stroke.color = foreground;
+        widget.bg_stroke.color = border;
+    }
+    visuals.widgets.hovered.bg_fill = with_alpha(accent, 50);
+    visuals.widgets.active.bg_fill = with_alpha(accent, 86);
+    ctx.set_visuals(visuals);
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -67,8 +187,9 @@ struct Sample {
     up: u64,
 }
 struct App {
-    wallpaper: TextureHandle,
-    _blurred_wallpaper: TextureHandle,
+    palette_path: Option<std::path::PathBuf>,
+    palette_modified: Option<SystemTime>,
+    last_palette_check: Instant,
     system: System,
     networks: Networks,
     disks: Disks,
@@ -128,8 +249,15 @@ impl App {
             .iter_mut()
             .for_each(|(_, font)| font.size = (font.size * 1.12).min(22.));
         ctx.set_style_of(egui::Theme::Dark, style);
-        let (wallpaper, blurred_wallpaper) = load_wallpapers(ctx);
-        GLASS_TEXTURE.with(|texture| *texture.borrow_mut() = Some(blurred_wallpaper.clone()));
+        let palette_path = system_scheme_path();
+        let palette_modified = palette_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok());
+        if let Some(palette) = palette_path.as_deref().and_then(parse_system_palette) {
+            install_palette(palette);
+        }
+        apply_egui_palette(ctx);
         let mut system = System::new_all().expect("No se pudo inicializar sysinfo");
         system.refresh_all();
         let mut networks = Networks::new_with_refreshed_list().expect("No se pudo leer la red");
@@ -178,8 +306,9 @@ impl App {
             }
         });
         Self {
-            wallpaper,
-            _blurred_wallpaper: blurred_wallpaper,
+            palette_path,
+            palette_modified,
+            last_palette_check: Instant::now(),
             system,
             networks,
             disks,
@@ -384,14 +513,14 @@ impl App {
             ui.vertical(|ui| {
                 ui.heading(
                     egui::RichText::new(title)
-                        .color(SECONDARY)
+                        .color(secondary())
                         .size(22.)
                         .strong(),
                 );
-                ui.label(egui::RichText::new(subtitle).color(MUTED).size(12.));
+                ui.label(egui::RichText::new(subtitle).color(muted()).size(12.));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                glass_frame(GLASS_STRONG, 8.).show(ui, |ui| {
+                glass_frame(glass_strong(), 8.).show(ui, |ui| {
                     ui.monospace(chrono_like_time());
                 });
             });
@@ -421,18 +550,18 @@ impl App {
                 &mut cols[0],
                 "CPU total",
                 Icon::Cpu,
-                SECONDARY,
+                secondary(),
                 52.,
                 |ui| {
                     ui.label(
                         egui::RichText::new(format!("{:.1}%", self.sample.cpu))
                             .size(23.)
                             .strong()
-                            .color(SECONDARY),
+                            .color(secondary()),
                     );
                     ui.add(
                         egui::ProgressBar::new((self.sample.cpu / 100.).clamp(0., 1.))
-                            .fill(SECONDARY)
+                            .fill(secondary())
                             .desired_height(10.),
                     );
                 },
@@ -441,7 +570,7 @@ impl App {
                 &mut cols[1],
                 "Carga media",
                 Icon::Chart,
-                SECONDARY,
+                secondary(),
                 52.,
                 |ui| {
                     if let Some(load) = &load {
@@ -452,7 +581,7 @@ impl App {
                         let cores = self.system.cpus().len().max(1) as f32;
                         ui.add(
                             egui::ProgressBar::new((load.one as f32 / cores).clamp(0., 1.))
-                                .fill(SECONDARY)
+                                .fill(secondary())
                                 .desired_height(10.),
                         );
                     } else {
@@ -461,14 +590,21 @@ impl App {
                     }
                 },
             );
-            panel_icon_with_min_height(&mut cols[2], "Núcleos", Icon::Cpu, SECONDARY, 52., |ui| {
-                ui.label(format!(
-                    "{} lógicos · {} físicos",
-                    self.system.cpus().len(),
-                    System::physical_core_count().unwrap_or(0)
-                ));
-            });
-            panel_icon_with_min_height(&mut cols[3], "GPU", Icon::Gpu, SECONDARY, 52., |ui| {
+            panel_icon_with_min_height(
+                &mut cols[2],
+                "Núcleos",
+                Icon::Cpu,
+                secondary(),
+                52.,
+                |ui| {
+                    ui.label(format!(
+                        "{} lógicos · {} físicos",
+                        self.system.cpus().len(),
+                        System::physical_core_count().unwrap_or(0)
+                    ));
+                },
+            );
+            panel_icon_with_min_height(&mut cols[3], "GPU", Icon::Gpu, secondary(), 52., |ui| {
                 let usage = self.gpu_samples.first().and_then(|g| g.usage);
                 ui.label(
                     usage
@@ -480,7 +616,7 @@ impl App {
                 &mut cols[4],
                 "Temperatura",
                 Icon::Temperature,
-                SECONDARY,
+                secondary(),
                 52.,
                 |ui| {
                     ui.label(format!(
@@ -497,19 +633,23 @@ impl App {
         });
         ui.add_space(16.);
         ui.columns(2, |cols| {
-            panel_icon(&mut cols[0], "Historial de CPU", Icon::Chart, TEAL, |ui| {
-                chart(ui, &self.cpu_history_detail, TEAL)
-            });
+            panel_icon(
+                &mut cols[0],
+                "Historial de CPU",
+                Icon::Chart,
+                teal(),
+                |ui| chart(ui, &self.cpu_history_detail, teal()),
+            );
             panel_icon(
                 &mut cols[1],
                 "Historial de GPU",
                 Icon::Gpu,
-                TERTIARY,
-                |ui| chart(ui, &self.gpu_history, TERTIARY),
+                tertiary(),
+                |ui| chart(ui, &self.gpu_history, tertiary()),
             );
         });
         ui.add_space(16.);
-        panel_icon(ui, "Núcleos de CPU", Icon::Cpu, TEAL, |ui| {
+        panel_icon(ui, "Núcleos de CPU", Icon::Cpu, teal(), |ui| {
             let cpus = self.system.cpus();
             let count = cpus.len().max(1);
             let available = ui.available_width();
@@ -536,19 +676,19 @@ impl App {
                                 |tile| {
                                     egui::Frame::new()
                                         .fill(Color32::from_rgba_unmultiplied(
-                                            PRIMARY.r(),
-                                            PRIMARY.g(),
-                                            PRIMARY.b(),
+                                            primary().r(),
+                                            primary().g(),
+                                            primary().b(),
                                             238,
                                         ))
-                                        .stroke(Stroke::new(1., GLASS_BORDER))
+                                        .stroke(Stroke::new(1., glass_border()))
                                         .corner_radius(14.)
                                         .inner_margin(egui::Margin::symmetric(10, 8))
                                         .show(tile, |tile| {
                                             tile.horizontal(|tile| {
                                                 tile.label(
                                                     egui::RichText::new(format!("Core {index}"))
-                                                        .color(MUTED)
+                                                        .color(muted())
                                                         .size(13.),
                                                 );
                                                 tile.with_layout(
@@ -561,7 +701,7 @@ impl App {
                                                                 "{:.0}%",
                                                                 cpu.usage()
                                                             ))
-                                                            .color(SECONDARY)
+                                                            .color(secondary())
                                                             .size(17.)
                                                             .strong(),
                                                         );
@@ -571,7 +711,7 @@ impl App {
                                             tile.add_space(6.);
                                             tile.add(
                                                 egui::ProgressBar::new(cpu.usage() / 100.)
-                                                    .fill(SECONDARY)
+                                                    .fill(secondary())
                                                     .desired_height(9.),
                                             );
                                             tile.add_space(4.);
@@ -580,7 +720,7 @@ impl App {
                                                     "{} MHz",
                                                     cpu.frequency()
                                                 ))
-                                                .color(MUTED)
+                                                .color(muted())
                                                 .size(11.),
                                             );
                                         });
@@ -594,7 +734,7 @@ impl App {
             });
         });
         ui.add_space(12.);
-        panel_icon(ui, "GPU detectada", Icon::Gpu, PURPLE, |ui| {
+        panel_icon(ui, "GPU detectada", Icon::Gpu, purple(), |ui| {
             if self.gpu_samples.is_empty() {
                 ui.label("No se detectó una GPU con telemetría disponible.");
             }
@@ -634,7 +774,7 @@ impl App {
                     bytes(used),
                     used as f32 * 100. / total.max(1) as f32,
                     total_label.clone(),
-                    BLUE,
+                    blue(),
                 );
                 memory_stat_panel(
                     &mut cols[1],
@@ -642,7 +782,7 @@ impl App {
                     bytes(free),
                     free as f32 * 100. / total.max(1) as f32,
                     total_label.clone(),
-                    TEAL,
+                    teal(),
                 );
             });
             ui.add_space(12.);
@@ -669,7 +809,7 @@ impl App {
                                     bytes(used),
                                     used as f32 * 100. / total.max(1) as f32,
                                     total_label.clone(),
-                                    BLUE,
+                                    blue(),
                                 );
                             },
                         );
@@ -684,7 +824,7 @@ impl App {
                                     bytes(free),
                                     free as f32 * 100. / total.max(1) as f32,
                                     total_label.clone(),
-                                    TEAL,
+                                    teal(),
                                 );
                             },
                         );
@@ -712,7 +852,7 @@ impl App {
             });
         }
         ui.add_space(16.);
-        panel_icon(ui, "Discos montados", Icon::Disk, BLUE, |ui| {
+        panel_icon(ui, "Discos montados", Icon::Disk, blue(), |ui| {
             let available_width = ui.available_width();
             let columns = ((available_width + 12.) / 292.).floor().max(1.) as usize;
             let columns = columns.min(self.disks.len().max(1)).min(4);
@@ -730,8 +870,8 @@ impl App {
                         egui::Layout::top_down(egui::Align::Min),
                         |card| {
                             egui::Frame::new()
-                                .fill(Color32::from_rgba_unmultiplied(176, 162, 123, 22))
-                                .stroke(Stroke::new(1., GLASS_BORDER))
+                                .fill(with_alpha(secondary(), 22))
+                                .stroke(Stroke::new(1., glass_border()))
                                 .corner_radius(14.)
                                 .inner_margin(14.)
                                 .show(card, |card| {
@@ -741,11 +881,11 @@ impl App {
                                         )
                                         .size(15.)
                                         .strong()
-                                        .color(SECONDARY),
+                                        .color(secondary()),
                                     );
                                     card.label(
                                         egui::RichText::new(disk.name().to_string_lossy())
-                                            .color(MUTED)
+                                            .color(muted())
                                             .size(12.),
                                     );
                                     card.add_space(6.);
@@ -753,7 +893,7 @@ impl App {
                                         egui::RichText::new(format!("{:.0}% usado", pct * 100.))
                                             .size(12.)
                                             .strong()
-                                            .color(SECONDARY),
+                                            .color(secondary()),
                                     );
                                     card.add_space(3.);
                                     card.add(
@@ -761,7 +901,7 @@ impl App {
                                             .fill(if pct > 0.9 {
                                                 Color32::from_rgb(205, 116, 104)
                                             } else {
-                                                BLUE
+                                                blue()
                                             })
                                             .desired_height(18.),
                                     );
@@ -770,7 +910,7 @@ impl App {
                                         card.label(
                                             egui::RichText::new(format!("{} usados", bytes(used)))
                                                 .size(12.)
-                                                .color(SECONDARY),
+                                                .color(secondary()),
                                         );
                                         card.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
@@ -781,7 +921,7 @@ impl App {
                                                         bytes(available)
                                                     ))
                                                     .size(12.)
-                                                    .color(SECONDARY),
+                                                    .color(secondary()),
                                                 );
                                             },
                                         );
@@ -793,11 +933,11 @@ impl App {
             });
         });
         ui.add_space(14.);
-        panel_icon(ui, "Historial de RAM", Icon::Memory, BLUE, |ui| {
+        panel_icon(ui, "Historial de RAM", Icon::Memory, blue(), |ui| {
             memory_chart(ui, &self.memory_history, false);
         });
         ui.add_space(12.);
-        panel_icon(ui, "Historial de Swap", Icon::Memory, SECONDARY, |ui| {
+        panel_icon(ui, "Historial de Swap", Icon::Memory, secondary(), |ui| {
             memory_chart(ui, &self.memory_history, true)
         });
     }
@@ -815,14 +955,14 @@ impl App {
         let (total_down, total_up) = self.networks.iter().fold((0u64, 0u64), |a, (_, n)| {
             (a.0 + n.total_received(), a.1 + n.total_transmitted())
         });
-        panel_icon(ui, "Interfaces e IP", Icon::Network, PURPLE, |ui| {
+        panel_icon(ui, "Interfaces e IP", Icon::Network, purple(), |ui| {
             ui.horizontal_wrapped(|ui| {
                 if self.interfaces.is_empty() {
                     ui.label("Sin IP detectada");
                 }
                 for address in &self.interfaces {
                     egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(176, 162, 123, 18))
+                        .fill(with_alpha(secondary(), 18))
                         .corner_radius(8.)
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .show(ui, |ui| {
@@ -838,7 +978,7 @@ impl App {
         });
         ui.add_space(12.);
         ui.columns(4, |cols| {
-            panel_icon(&mut cols[0], "Descarga", Icon::Download, TEAL, |ui| {
+            panel_icon(&mut cols[0], "Descarga", Icon::Download, teal(), |ui| {
                 ui.label(speed(self.sample.down));
                 ui.label(format!(
                     "Máx. {} · Prom. {}",
@@ -846,7 +986,7 @@ impl App {
                     speed(avg_down as u64)
                 ));
             });
-            panel_icon(&mut cols[1], "Subida", Icon::Upload, BLUE, |ui| {
+            panel_icon(&mut cols[1], "Subida", Icon::Upload, blue(), |ui| {
                 ui.label(speed(self.sample.up));
                 ui.label(format!(
                     "Máx. {} · Prom. {}",
@@ -854,14 +994,14 @@ impl App {
                     speed(avg_up as u64)
                 ));
             });
-            panel_icon(&mut cols[2], "Ping", Icon::Network, PURPLE, |ui| {
+            panel_icon(&mut cols[2], "Ping", Icon::Network, purple(), |ui| {
                 ui.label(
                     self.ping_ms
                         .map(|v| format!("{v:.1} ms"))
                         .unwrap_or_else(|| "No disponible".into()),
                 );
             });
-            panel_icon(&mut cols[3], "Jitter", Icon::Network, SECONDARY, |ui| {
+            panel_icon(&mut cols[3], "Jitter", Icon::Network, secondary(), |ui| {
                 ui.label(
                     self.jitter_ms
                         .map(|v| format!("{v:.1} ms"))
@@ -871,11 +1011,11 @@ impl App {
         });
         ui.add_space(16.);
         ui.columns(2, |cols| {
-            panel_icon(&mut cols[0], "Descarga", Icon::Download, TEAL, |ui| {
-                chart_scaled(ui, &self.download_history, TEAL)
+            panel_icon(&mut cols[0], "Descarga", Icon::Download, teal(), |ui| {
+                chart_scaled(ui, &self.download_history, teal())
             });
-            panel_icon(&mut cols[1], "Subida", Icon::Upload, BLUE, |ui| {
-                chart_scaled(ui, &self.upload_history, BLUE)
+            panel_icon(&mut cols[1], "Subida", Icon::Upload, blue(), |ui| {
+                chart_scaled(ui, &self.upload_history, blue())
             });
         });
     }
@@ -907,16 +1047,16 @@ impl App {
                         egui::Button::new(egui::RichText::new(label).size(13.))
                             .selected(selected)
                             .fill(if selected {
-                                Color32::from_rgba_unmultiplied(118, 173, 188, 78)
+                                with_alpha(tertiary(), 78)
                             } else {
-                                Color32::from_rgba_unmultiplied(176, 162, 123, 20)
+                                with_alpha(secondary(), 20)
                             })
                             .stroke(Stroke::new(
                                 1.,
                                 if selected {
-                                    Color32::from_rgba_unmultiplied(118, 173, 188, 110)
+                                    with_alpha(tertiary(), 110)
                                 } else {
-                                    Color32::from_rgba_unmultiplied(176, 162, 123, 38)
+                                    with_alpha(secondary(), 38)
                                 },
                             ))
                             .corner_radius(14.)
@@ -974,12 +1114,12 @@ impl App {
             }
         });
         ui.add_space(12.);
-        panel_icon(ui, "Procesos activos", Icon::Processes, BLUE, |ui| {
+        panel_icon(ui, "Procesos activos", Icon::Processes, blue(), |ui| {
             let table_width = ui.available_width();
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!("{} procesos", rows.len()))
-                        .color(MUTED)
+                        .color(muted())
                         .size(12.),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -989,12 +1129,12 @@ impl App {
                         } else {
                             "↑"
                         })
-                        .color(TEAL)
+                        .color(teal())
                         .size(13.),
                     );
                     ui.label(
                         egui::RichText::new(sort_label(self.process_sort))
-                            .color(MUTED)
+                            .color(muted())
                             .size(12.),
                     );
                 });
@@ -1042,8 +1182,28 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0., 0., 0., 0.]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.last_palette_check.elapsed() >= Duration::from_millis(500) {
+            self.last_palette_check = Instant::now();
+            if let Some(path) = self.palette_path.as_deref() {
+                let modified = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+                if modified.is_some() && modified != self.palette_modified {
+                    if let Some(palette) = parse_system_palette(path) {
+                        install_palette(palette);
+                        apply_egui_palette(&ctx);
+                        self.palette_modified = modified;
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
         let drawer_age = self
             .drawer_opened_at
             .map(|opened| opened.elapsed())
@@ -1057,7 +1217,6 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(200));
         let viewport = ui.max_rect();
-        paint_wallpaper(ui, &self.wallpaper);
         let sidebar_width = ctx.animate_value_with_time(
             egui::Id::NULL.with(egui::IdSalt::new("sidebar-width")),
             if self.sidebar_collapsed { 76. } else { 210. },
@@ -1083,16 +1242,16 @@ impl eframe::App for App {
                 ui.add_space(12.);
                 if sidebar_compact {
                     ui.vertical_centered(|ui| {
-                        icon(ui, Icon::Dashboard, TERTIARY, 24.);
+                        icon(ui, Icon::Dashboard, tertiary(), 24.);
                         ui.add_space(10.);
                         sidebar_toggle(ui, &mut self.sidebar_collapsed);
                     });
                 } else {
                     ui.horizontal(|ui| {
-                        icon(ui, Icon::Dashboard, TERTIARY, 26.);
+                        icon(ui, Icon::Dashboard, tertiary(), 26.);
                         ui.label(
                             egui::RichText::new("SysDash")
-                                .color(SECONDARY)
+                                .color(secondary())
                                 .size(21.)
                                 .strong(),
                         );
@@ -1107,7 +1266,7 @@ impl eframe::App for App {
                 if !sidebar_compact {
                     ui.label(
                         egui::RichText::new("MONITOR")
-                            .color(MUTED)
+                            .color(muted())
                             .size(10.)
                             .strong(),
                     );
@@ -1136,13 +1295,13 @@ impl eframe::App for App {
                             rect,
                             10.,
                             if selected {
-                                Color32::from_rgba_unmultiplied(118, 173, 188, 52)
+                                with_alpha(tertiary(), 52)
                             } else {
-                                Color32::from_rgba_unmultiplied(176, 162, 123, 18)
+                                with_alpha(secondary(), 18)
                             },
                         );
                     }
-                    let icon_color = if selected { TERTIARY } else { MUTED };
+                    let icon_color = if selected { tertiary() } else { muted() };
                     let icon_x = if sidebar_compact {
                         rect.center().x - 8.5
                     } else {
@@ -1159,7 +1318,7 @@ impl eframe::App for App {
                             egui::Align2::LEFT_CENTER,
                             label,
                             egui::FontId::proportional(15.),
-                            if selected { TERTIARY } else { MUTED },
+                            if selected { tertiary() } else { muted() },
                         );
                     }
                     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1174,7 +1333,7 @@ impl eframe::App for App {
                     ui.add_space(16.);
                     ui.label(
                         egui::RichText::new("SISTEMA")
-                            .color(MUTED)
+                            .color(muted())
                             .size(10.)
                             .strong(),
                     );
@@ -1189,9 +1348,9 @@ impl eframe::App for App {
                         rect,
                         10.,
                         if self.page == Page::Processes {
-                            Color32::from_rgba_unmultiplied(118, 173, 188, 48)
+                            with_alpha(tertiary(), 48)
                         } else {
-                            Color32::from_rgba_unmultiplied(176, 162, 123, 18)
+                            with_alpha(secondary(), 18)
                         },
                     );
                 }
@@ -1199,9 +1358,9 @@ impl eframe::App for App {
                     ui,
                     Icon::Processes,
                     if self.page == Page::Processes {
-                        TEAL
+                        teal()
                     } else {
-                        MUTED
+                        muted()
                     },
                     Rect::from_min_size(
                         Pos2::new(
@@ -1221,7 +1380,7 @@ impl eframe::App for App {
                         egui::Align2::LEFT_CENTER,
                         "Procesos",
                         egui::FontId::proportional(15.),
-                        MUTED,
+                        muted(),
                     );
                 }
                 let processes = processes.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -1235,10 +1394,10 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         let p = ui.painter();
                         let c = ui.cursor().center();
-                        p.circle_filled(c, 4., TEAL);
+                        p.circle_filled(c, 4., teal());
                         if !sidebar_compact {
                             ui.add_space(10.);
-                            ui.label(egui::RichText::new("Conectado").color(MUTED).size(11.));
+                            ui.label(egui::RichText::new("Conectado").color(muted()).size(11.));
                         }
                     });
                 });
@@ -1264,26 +1423,26 @@ impl eframe::App for App {
                             ui.vertical(|ui| {
                                 ui.heading(
                                     egui::RichText::new("Panel General")
-                                        .color(SECONDARY)
+                                        .color(secondary())
                                         .size(20.)
                                         .strong(),
                                 );
                                 ui.label(
                                     egui::RichText::new("Monitoreo en tiempo real")
-                                        .color(MUTED)
+                                        .color(muted())
                                         .size(11.),
                                 );
                             });
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    glass_frame(GLASS_STRONG, 8.)
+                                    glass_frame(glass_strong(), 8.)
                                         .inner_margin(egui::Margin::symmetric(10, 6))
                                         .show(ui, |ui| {
                                             ui.label(
                                                 egui::RichText::new(chrono_like_time())
                                                     .monospace()
-                                                    .color(MUTED)
+                                                    .color(muted())
                                                     .size(11.),
                                             );
                                         });
@@ -1302,40 +1461,44 @@ impl eframe::App for App {
                                 "CPU",
                                 format!("{:.1}%", self.sample.cpu),
                                 self.sample.cpu,
-                                TEAL,
+                                teal(),
                             );
                             metric(
                                 &mut cols[1],
                                 "RAM",
                                 format!("{:.1} GB", self.sample.ram_used),
                                 ram as f32,
-                                BLUE,
+                                blue(),
                             );
-                            panel_icon(&mut cols[2], "RED", Icon::Network, PURPLE, |ui| {
+                            panel_icon(&mut cols[2], "RED", Icon::Network, purple(), |ui| {
                                 ui.horizontal(|ui| {
-                                    icon(ui, Icon::Download, TEAL, 13.);
-                                    ui.colored_label(TEAL, speed(self.sample.down));
+                                    icon(ui, Icon::Download, teal(), 13.);
+                                    ui.colored_label(teal(), speed(self.sample.down));
                                 });
                                 ui.horizontal(|ui| {
-                                    icon(ui, Icon::Upload, BLUE, 13.);
-                                    ui.colored_label(BLUE, speed(self.sample.up));
+                                    icon(ui, Icon::Upload, blue(), 13.);
+                                    ui.colored_label(blue(), speed(self.sample.up));
                                 });
                             });
                             let (battery, _charging) = battery_info();
-                            panel_icon(&mut cols[3], "BATERÍA", Icon::Battery, SECONDARY, |ui| {
+                            panel_icon(&mut cols[3], "BATERÍA", Icon::Battery, secondary(), |ui| {
                                 if let Some(level) = battery {
                                     ui.label(
                                         egui::RichText::new(format!("{level}%"))
                                             .size(23.)
                                             .strong()
-                                            .color(SECONDARY),
+                                            .color(secondary()),
                                     );
                                     ui.add(
-                                        egui::ProgressBar::new(level as f32 / 100.).fill(SECONDARY),
+                                        egui::ProgressBar::new(level as f32 / 100.)
+                                            .fill(secondary()),
                                     );
                                 } else {
                                     ui.label(
-                                        egui::RichText::new("N/A").size(23.).strong().color(MUTED),
+                                        egui::RichText::new("N/A")
+                                            .size(23.)
+                                            .strong()
+                                            .color(muted()),
                                     );
                                 }
                             });
@@ -1348,21 +1511,21 @@ impl eframe::App for App {
                                 Vec2::new(width * 0.62, chart_row_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    panel_icon(ui, "Uso de CPU", Icon::Cpu, TEAL, |ui| {
+                                    panel_icon(ui, "Uso de CPU", Icon::Cpu, teal(), |ui| {
                                         ui.horizontal(|ui| {
                                             ui.label(
                                                 egui::RichText::new("Últimos 20 puntos")
-                                                    .color(MUTED)
+                                                    .color(muted())
                                                     .size(10.),
                                             );
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    ui.colored_label(TEAL, "LIVE");
+                                                    ui.colored_label(teal(), "LIVE");
                                                 },
                                             );
                                         });
-                                        chart(ui, &self.cpu_history, TEAL);
+                                        chart(ui, &self.cpu_history, teal());
                                     });
                                 },
                             );
@@ -1370,10 +1533,10 @@ impl eframe::App for App {
                                 Vec2::new(width * 0.38 - 8., chart_row_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    panel_icon(ui, "Historial", Icon::Chart, PURPLE, |ui| {
+                                    panel_icon(ui, "Historial", Icon::Chart, purple(), |ui| {
                                         ui.label(
                                             egui::RichText::new("CPU & RAM promedio")
-                                                .color(MUTED)
+                                                .color(muted())
                                                 .size(10.),
                                         );
                                         history_chart(ui, &self.history);
@@ -1382,11 +1545,11 @@ impl eframe::App for App {
                             );
                         });
                         ui.add_space(16.);
-                        panel_icon(ui, "Procesos", Icon::Processes, BLUE, |ui| {
+                        panel_icon(ui, "Procesos", Icon::Processes, blue(), |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new("Cinco con mayor consumo")
-                                        .color(MUTED)
+                                        .color(muted())
                                         .size(12.),
                                 );
                                 ui.with_layout(
@@ -1402,11 +1565,17 @@ impl eframe::App for App {
                                                     .selected(active)
                                                     .fill(if active {
                                                         Color32::from_rgba_unmultiplied(
-                                                            39, 160, 162, 118,
+                                                            tertiary().r(),
+                                                            tertiary().g(),
+                                                            tertiary().b(),
+                                                            118,
                                                         )
                                                     } else {
                                                         Color32::from_rgba_unmultiplied(
-                                                            220, 235, 240, 20,
+                                                            secondary().r(),
+                                                            secondary().g(),
+                                                            secondary().b(),
+                                                            20,
                                                         )
                                                     })
                                                     .corner_radius(12.),
@@ -1476,7 +1645,7 @@ impl eframe::App for App {
                                         ui,
                                         "Ver todos los procesos",
                                         Icon::Processes,
-                                        PRIMARY,
+                                        primary(),
                                     )
                                     .clicked()
                                     {
@@ -1548,19 +1717,7 @@ impl App {
                 let (rect, response) =
                     ui.allocate_exact_size(viewport.size(), egui::Sense::click());
                 let painter = ui.painter_at(rect);
-                if let Some(texture) = GLASS_TEXTURE.with(|texture| texture.borrow().clone()) {
-                    painter.image(
-                        texture.id(),
-                        rect,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)),
-                        Color32::from_white_alpha((progress * 28.) as u8),
-                    );
-                }
-                painter.rect_filled(
-                    rect,
-                    0.,
-                    Color32::from_rgba_unmultiplied(4, 8, 12, (progress * 198.) as u8),
-                );
+                painter.rect_filled(rect, 0., with_alpha(primary(), (progress * 198.) as u8));
                 if response.clicked() {
                     self.process_drawer_open = false;
                 }
@@ -1599,7 +1756,7 @@ impl App {
                                 egui::RichText::new(&row.name)
                                     .size(22.)
                                     .strong()
-                                    .color(SECONDARY),
+                                    .color(secondary()),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -1607,7 +1764,7 @@ impl App {
                                     row.pid, row.status
                                 ))
                                 .size(13.)
-                                .color(MUTED),
+                                .color(muted()),
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
@@ -1627,18 +1784,18 @@ impl App {
                 panel.add_space(14.);
                 let col_width = (inner.width() - 20.) / 2.;
                 let metrics = [
-                    ("CPU", format!("{:.1}%", row.cpu), TEAL),
-                    ("Memoria", compact_bytes(row.memory), BLUE),
-                    ("Hilos", row.threads.to_string(), PURPLE),
-                    ("Usuario", row.owner.clone(), MUTED),
+                    ("CPU", format!("{:.1}%", row.cpu), teal()),
+                    ("Memoria", compact_bytes(row.memory), blue()),
+                    ("Hilos", row.threads.to_string(), purple()),
+                    ("Usuario", row.owner.clone(), muted()),
                     (
                         "Padre",
                         row.parent
                             .map(|pid| pid.to_string())
                             .unwrap_or_else(|| "—".into()),
-                        MUTED,
+                        muted(),
                     ),
-                    ("Activo", format_duration(row.runtime), MUTED),
+                    ("Activo", format_duration(row.runtime), muted()),
                 ];
                 for row_index in 0..3 {
                     panel.scope(|ui| {
@@ -1680,19 +1837,19 @@ impl App {
                     ui.add_space(12.);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new("Lectura").color(MUTED).size(12.));
+                            ui.label(egui::RichText::new("Lectura").color(muted()).size(12.));
                             ui.label(
                                 egui::RichText::new(bytes(row.read))
-                                    .color(SECONDARY)
+                                    .color(secondary())
                                     .strong(),
                             );
                         });
                         ui.add_space(28.);
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new("Escritura").color(MUTED).size(12.));
+                            ui.label(egui::RichText::new("Escritura").color(muted()).size(12.));
                             ui.label(
                                 egui::RichText::new(bytes(row.written))
-                                    .color(SECONDARY)
+                                    .color(secondary())
                                     .strong(),
                             );
                         });
@@ -1703,7 +1860,7 @@ impl App {
                     ui.add_space(12.);
                     ui.label(
                         egui::RichText::new("Historial de CPU y memoria")
-                            .color(SECONDARY)
+                            .color(secondary())
                             .size(14.)
                             .strong(),
                     );
@@ -1711,7 +1868,7 @@ impl App {
                     if let Some(history) = history {
                         process_history_chart(ui, history);
                     } else {
-                        ui.label(egui::RichText::new("Recopilando datos…").color(MUTED));
+                        ui.label(egui::RichText::new("Recopilando datos…").color(muted()));
                     }
                 });
                 panel.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
@@ -1780,14 +1937,14 @@ fn sidebar_toggle(ui: &mut egui::Ui, collapsed: &mut bool) {
     };
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.), egui::Sense::click());
     ui.painter()
-        .rect_filled(rect, 9., Color32::from_rgba_unmultiplied(176, 162, 123, 14));
+        .rect_filled(rect, 9., with_alpha(secondary(), 14));
     ui.painter().rect_stroke(
         rect,
         9.,
-        Stroke::new(1., GLASS_BORDER),
+        Stroke::new(1., glass_border()),
         egui::StrokeKind::Inside,
     );
-    paint_icon(ui, icon, TERTIARY, rect.shrink(7.));
+    paint_icon(ui, icon, tertiary(), rect.shrink(7.));
     let response = response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .on_hover_text(if *collapsed {
@@ -1800,15 +1957,10 @@ fn sidebar_toggle(ui: &mut egui::Ui, collapsed: &mut bool) {
     }
 }
 
-thread_local! {
-    static GLASS_TEXTURE: std::cell::RefCell<Option<TextureHandle>> = const { std::cell::RefCell::new(None) };
-    static GLASS_VIEWPORT: std::cell::Cell<Rect> = const { std::cell::Cell::new(Rect::NOTHING) };
-}
-
 fn glass_frame(fill: Color32, padding: f32) -> egui::Frame {
     egui::Frame::new()
         .fill(fill)
-        .stroke(Stroke::new(1., GLASS_BORDER))
+        .stroke(Stroke::new(1., glass_border()))
         .corner_radius(16.)
         .inner_margin(padding)
 }
@@ -1861,7 +2013,7 @@ fn panel_icon_with_min_height(
     content.horizontal(|ui| {
         ui.label(
             egui::RichText::new(title)
-                .color(SECONDARY)
+                .color(secondary())
                 .size(17.)
                 .strong(),
         );
@@ -1875,78 +2027,18 @@ fn panel_icon_with_min_height(
 
 fn paint_glass_surface(ui: &egui::Ui, rect: Rect, rounding: f32) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(
-        rect.expand(5.),
-        rounding + 4.,
-        Color32::from_rgba_unmultiplied(3, 15, 22, 72),
-    );
-    let viewport = GLASS_VIEWPORT.with(std::cell::Cell::get);
-    let texture = GLASS_TEXTURE.with(|texture| texture.borrow().clone());
-    if let Some(texture) = texture.filter(|_| viewport.width() > 0. && viewport.height() > 0.) {
-        let mut mesh = egui::epaint::Mesh::with_texture(texture.id());
-        let uv_at = |point: Pos2| {
-            Pos2::new(
-                ((point.x - viewport.left()) / viewport.width()).clamp(0., 1.),
-                ((point.y - viewport.top()) / viewport.height()).clamp(0., 1.),
-            )
-        };
-        let center_index = 0;
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: rect.center(),
-            uv: uv_at(rect.center()),
-            color: Color32::WHITE,
-        });
-        let radius = rounding.min(rect.width() * 0.5).min(rect.height() * 0.5);
-        let corners = [
-            (
-                Pos2::new(rect.right() - radius, rect.top() + radius),
-                -std::f32::consts::FRAC_PI_2,
-            ),
-            (Pos2::new(rect.right() - radius, rect.bottom() - radius), 0.),
-            (
-                Pos2::new(rect.left() + radius, rect.bottom() - radius),
-                std::f32::consts::FRAC_PI_2,
-            ),
-            (
-                Pos2::new(rect.left() + radius, rect.top() + radius),
-                std::f32::consts::PI,
-            ),
-        ];
-        for (corner, start_angle) in corners {
-            for step in 0..=12 {
-                let angle = start_angle + std::f32::consts::FRAC_PI_2 * step as f32 / 12.;
-                let point = Pos2::new(
-                    corner.x + radius * angle.cos(),
-                    corner.y + radius * angle.sin(),
-                );
-                mesh.vertices.push(egui::epaint::Vertex {
-                    pos: point,
-                    uv: uv_at(point),
-                    color: Color32::WHITE,
-                });
-            }
-        }
-        let ring_count = mesh.vertices.len() - 1;
-        for index in 0..ring_count {
-            let current = index as u32 + 1;
-            let next = ((index + 1) % ring_count) as u32 + 1;
-            mesh.add_triangle(center_index, current, next);
-        }
-        painter.add(egui::Shape::mesh(mesh));
-    } else {
-        painter.rect_filled(rect, rounding, GLASS);
-    }
-    painter.rect_filled(rect, rounding, GLASS);
+    painter.rect_filled(rect.expand(5.), rounding + 4., with_alpha(primary(), 56));
+    painter.rect_filled(rect, rounding, glass());
     painter.rect_stroke(
         rect,
         rounding,
-        Stroke::new(1.2, GLASS_BORDER),
+        Stroke::new(1.2, glass_border()),
         egui::StrokeKind::Inside,
     );
     painter.rect_stroke(
         rect.shrink(2.),
         (rounding - 2.).max(0.),
-        Stroke::new(0.8, Color32::from_rgba_unmultiplied(176, 162, 123, 26)),
+        Stroke::new(0.8, with_alpha(secondary(), 26)),
         egui::StrokeKind::Inside,
     );
     painter.line_segment(
@@ -1954,7 +2046,7 @@ fn paint_glass_surface(ui: &egui::Ui, rect: Rect, rounding: f32) {
             Pos2::new(rect.left() + rounding, rect.top() + 1.),
             Pos2::new(rect.right() - rounding, rect.top() + 1.),
         ],
-        Stroke::new(1., Color32::from_rgba_unmultiplied(176, 162, 123, 45)),
+        Stroke::new(1., with_alpha(secondary(), 45)),
     );
 }
 
@@ -1984,13 +2076,13 @@ fn process_table_header(ui: &mut egui::Ui, widths: &[f32], labels: &[&str], righ
             },
             *label,
             egui::FontId::proportional(12.),
-            MUTED,
+            muted(),
         );
         x += cell_width;
     }
     ui.painter().line_segment(
         [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1., Color32::from_rgba_unmultiplied(176, 162, 123, 48)),
+        Stroke::new(1., with_alpha(secondary(), 48)),
     );
 }
 
@@ -2002,20 +2094,19 @@ fn icon_action_button(
 ) -> egui::Response {
     let response = ui.add_sized(
         Vec2::new(218., 40.),
-        egui::Button::new(egui::RichText::new(label).size(13.).strong().color(PRIMARY))
-            .fill(TERTIARY)
-            .stroke(Stroke::new(
-                1.,
-                Color32::from_rgba_unmultiplied(118, 173, 188, 150),
-            ))
-            .corner_radius(13.),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(13.)
+                .strong()
+                .color(primary()),
+        )
+        .fill(tertiary())
+        .stroke(Stroke::new(1., with_alpha(tertiary(), 150)))
+        .corner_radius(13.),
     );
     if response.hovered() {
-        ui.painter().rect_filled(
-            response.rect,
-            13.,
-            Color32::from_rgba_unmultiplied(118, 173, 188, 48),
-        );
+        ui.painter()
+            .rect_filled(response.rect, 13., with_alpha(tertiary(), 48));
     }
     let icon_rect = Rect::from_center_size(
         Pos2::new(response.rect.left() + 24., response.rect.center().y),
@@ -2036,9 +2127,9 @@ fn process_table_row(
     let width: f32 = widths.iter().sum();
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::click());
     let fill = if selected {
-        Color32::from_rgba_unmultiplied(118, 173, 188, 30)
+        with_alpha(tertiary(), 30)
     } else if response.hovered() {
-        Color32::from_rgba_unmultiplied(176, 162, 123, 24)
+        with_alpha(secondary(), 24)
     } else {
         Color32::TRANSPARENT
     };
@@ -2047,7 +2138,7 @@ fn process_table_row(
         ui.painter().rect_filled(
             Rect::from_min_max(rect.left_top(), Pos2::new(rect.left() + 3., rect.bottom())),
             1.5,
-            TEAL,
+            teal(),
         );
     }
     let mut x = rect.left();
@@ -2079,18 +2170,18 @@ fn process_table_row(
                 egui::FontId::proportional(14.)
             },
             if index == 0 {
-                MUTED
+                muted()
             } else if value.ends_with('%') {
-                TEAL
+                teal()
             } else {
-                SECONDARY
+                secondary()
             },
         );
         x += cell_width;
     }
     ui.painter().line_segment(
         [rect.left_bottom(), rect.right_bottom()],
-        Stroke::new(1., Color32::from_rgba_unmultiplied(176, 162, 123, 34)),
+        Stroke::new(1., with_alpha(secondary(), 34)),
     );
     response.clicked()
 }
@@ -2149,16 +2240,16 @@ fn process_detail_chip(ui: &mut egui::Ui, width: f32, label: &str, value: String
     let size = Vec2::new(width.max(72.), 68.);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let fill = if response.hovered() {
-        Color32::from_rgba_unmultiplied(118, 173, 188, 44)
+        with_alpha(tertiary(), 44)
     } else {
-        Color32::from_rgba_unmultiplied(176, 162, 123, 28)
+        with_alpha(secondary(), 28)
     };
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 16., fill);
     painter.rect_stroke(
         rect,
         16.,
-        Stroke::new(1., Color32::from_rgba_unmultiplied(176, 162, 123, 48)),
+        Stroke::new(1., with_alpha(secondary(), 48)),
         egui::StrokeKind::Inside,
     );
     painter.text(
@@ -2166,7 +2257,7 @@ fn process_detail_chip(ui: &mut egui::Ui, width: f32, label: &str, value: String
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(11.),
-        MUTED,
+        muted(),
     );
     painter.text(
         Pos2::new(rect.center().x, rect.center().y + 12.),
@@ -2179,11 +2270,11 @@ fn process_detail_chip(ui: &mut egui::Ui, width: f32, label: &str, value: String
 
 fn detail_section(ui: &mut egui::Ui, title: &str, value: &str) {
     ui.add_space(6.);
-    ui.label(egui::RichText::new(title).color(MUTED).size(12.));
+    ui.label(egui::RichText::new(title).color(muted()).size(12.));
     ui.label(
         egui::RichText::new(value)
             .monospace()
-            .color(SECONDARY)
+            .color(secondary())
             .size(12.),
     );
 }
@@ -2197,7 +2288,7 @@ fn metric(ui: &mut egui::Ui, title: &str, value: String, pct: f32, color: Color3
             egui::RichText::new(value.clone())
                 .size(23.)
                 .strong()
-                .color(SECONDARY),
+                .color(secondary()),
         );
         if pct > 0. {
             ui.add(
@@ -2223,13 +2314,13 @@ fn memory_stat_panel(
                 egui::RichText::new(value.clone())
                     .size(22.)
                     .strong()
-                    .color(SECONDARY),
+                    .color(secondary()),
             );
             ui.label(egui::RichText::new(format!("{percent:.0}%")).color(color));
         });
         ui.label(
             egui::RichText::new(format!("de {total} físicos"))
-                .color(MUTED)
+                .color(muted())
                 .size(12.),
         );
         ui.add_space(4.);
@@ -2256,19 +2347,23 @@ fn memory_donut(ui: &mut egui::Ui, fraction: f32, color: Color32, value: String,
                 egui::RichText::new(value.clone())
                     .size(17.)
                     .strong()
-                    .color(SECONDARY),
+                    .color(secondary()),
             );
-            ui.label(egui::RichText::new(subtitle.clone()).size(11.).color(MUTED));
+            ui.label(
+                egui::RichText::new(subtitle.clone())
+                    .size(11.)
+                    .color(muted()),
+            );
         });
     });
 }
 
 fn memory_cache_panel(ui: &mut egui::Ui, cached: u64, total: u64) {
-    panel_icon(ui, "Caché", Icon::Memory, SECONDARY, |ui| {
+    panel_icon(ui, "Caché", Icon::Memory, secondary(), |ui| {
         memory_donut(
             ui,
             cached as f32 / total.max(1) as f32,
-            SECONDARY,
+            secondary(),
             bytes(cached),
             format!("de {} RAM", bytes(total)),
         );
@@ -2276,49 +2371,15 @@ fn memory_cache_panel(ui: &mut egui::Ui, cached: u64, total: u64) {
 }
 
 fn memory_swap_panel(ui: &mut egui::Ui, used: u64, total: u64) {
-    panel_icon(ui, "Swap", Icon::Memory, SECONDARY, |ui| {
+    panel_icon(ui, "Swap", Icon::Memory, secondary(), |ui| {
         memory_donut(
             ui,
             used as f32 / total.max(1) as f32,
-            SECONDARY,
+            secondary(),
             bytes(used),
             format!("de {} swap", bytes(total)),
         );
     });
-}
-
-fn load_wallpapers(ctx: &egui::Context) -> (TextureHandle, TextureHandle) {
-    let source = image::load_from_memory(include_bytes!("../assets/wallpaper.png"))
-        .expect("El wallpaper incluido debe ser un PNG válido")
-        .resize_to_fill(1920, 1080, image::imageops::FilterType::Triangle);
-    let sharp = source.to_rgba8();
-    let blurred = source.blur(26.0).to_rgba8();
-    let to_texture = |name: &str, image: image::RgbaImage| {
-        let size = [image.width() as usize, image.height() as usize];
-        let pixels = image.into_raw();
-        ctx.load_texture(
-            name,
-            egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
-            egui::TextureOptions::LINEAR,
-        )
-    };
-    (
-        to_texture("sharp-wallpaper", sharp),
-        to_texture("glass-blur-wallpaper", blurred),
-    )
-}
-
-fn paint_wallpaper(ui: &egui::Ui, wallpaper: &TextureHandle) {
-    let rect = ui.max_rect();
-    GLASS_VIEWPORT.with(|viewport| viewport.set(rect));
-    let painter = ui.painter();
-    painter.image(
-        wallpaper.id(),
-        rect,
-        Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)),
-        Color32::WHITE,
-    );
-    painter.rect_filled(rect, 0., Color32::from_rgba_unmultiplied(29, 32, 33, 82));
 }
 
 fn icon(ui: &mut egui::Ui, kind: Icon, color: Color32, size: f32) {
@@ -2693,7 +2754,7 @@ enum ChartUnits {
 
 fn chart(ui: &mut egui::Ui, data: &VecDeque<f32>, color: Color32) {
     let values: Vec<_> = data.iter().copied().collect();
-    let label = if color == TERTIARY { "GPU" } else { "CPU" };
+    let label = if color == tertiary() { "GPU" } else { "CPU" };
     draw_chart(ui, &[(label, &values, color)], 100., 1, ChartUnits::Percent);
 }
 
@@ -2702,7 +2763,7 @@ fn history_chart(ui: &mut egui::Ui, data: &[(f32, f32)]) {
     let ram: Vec<_> = data.iter().map(|sample| sample.1).collect();
     draw_chart(
         ui,
-        &[("CPU", &cpu, SECONDARY), ("RAM", &ram, TERTIARY)],
+        &[("CPU", &cpu, secondary()), ("RAM", &ram, tertiary())],
         100.,
         60,
         ChartUnits::Percent,
@@ -2714,7 +2775,7 @@ fn process_history_chart(ui: &mut egui::Ui, data: &VecDeque<(f32, f32)>) {
     let ram: Vec<_> = data.iter().map(|sample| sample.1).collect();
     draw_chart(
         ui,
-        &[("CPU", &cpu, SECONDARY), ("RAM", &ram, TERTIARY)],
+        &[("CPU", &cpu, secondary()), ("RAM", &ram, tertiary())],
         100.,
         1,
         ChartUnits::Percent,
@@ -2723,7 +2784,7 @@ fn process_history_chart(ui: &mut egui::Ui, data: &VecDeque<(f32, f32)>) {
 
 fn memory_chart(ui: &mut egui::Ui, data: &VecDeque<(f32, f32)>, swap: bool) {
     let label = if swap { "Swap" } else { "RAM" };
-    let color = if swap { TERTIARY } else { SECONDARY };
+    let color = if swap { tertiary() } else { secondary() };
     let values: Vec<_> = data
         .iter()
         .map(|sample| if swap { sample.1 } else { sample.0 })
@@ -2748,7 +2809,7 @@ fn draw_chart(
         return;
     }
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 12., Color32::from_rgba_unmultiplied(29, 32, 33, 108));
+    painter.rect_filled(rect, 12., with_alpha(primary(), 108));
 
     let plot = Rect::from_min_max(
         Pos2::new(rect.left() + 48., rect.top() + 12.),
@@ -2761,7 +2822,7 @@ fn draw_chart(
             [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
             Stroke::new(
                 if tick == 0 { 1.2 } else { 0.8 },
-                Color32::from_rgba_unmultiplied(176, 162, 123, if tick == 0 { 62 } else { 34 }),
+                with_alpha(secondary(), if tick == 0 { 62 } else { 34 }),
             ),
         );
         let label = match units {
@@ -2774,7 +2835,7 @@ fn draw_chart(
             egui::Align2::RIGHT_CENTER,
             label,
             egui::FontId::proportional(10.),
-            MUTED,
+            muted(),
         );
     }
     for tick in 0..=4 {
@@ -2782,7 +2843,7 @@ fn draw_chart(
         let x = plot.left() + plot.width() * ratio;
         painter.line_segment(
             [Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())],
-            Stroke::new(0.7, Color32::from_rgba_unmultiplied(176, 162, 123, 22)),
+            Stroke::new(0.7, with_alpha(secondary(), 22)),
         );
     }
 
@@ -2840,7 +2901,7 @@ fn draw_chart(
             egui::Align2::CENTER_CENTER,
             label,
             egui::FontId::proportional(10.),
-            MUTED,
+            muted(),
         );
     }
     if plotted.len() > 1 {
@@ -2853,7 +2914,7 @@ fn draw_chart(
                 egui::Align2::LEFT_CENTER,
                 *name,
                 egui::FontId::proportional(10.),
-                MUTED,
+                muted(),
             );
             legend_x += 58.;
         }
@@ -2877,7 +2938,7 @@ fn draw_chart(
             let index = (x_ratio * values.len().saturating_sub(1) as f32).round() as usize;
             if let (Some(value), Some(point)) = (values.get(index), points.get(index)) {
                 painter.circle_filled(*point, 5., *color);
-                painter.circle_stroke(*point, 7., Stroke::new(1., SECONDARY));
+                painter.circle_stroke(*point, 7., Stroke::new(1., secondary()));
                 selected.push((*name, *value, *color));
             }
         }
@@ -2922,6 +2983,8 @@ fn chrono_like_time() -> String {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("sys-dashboard")
+            .with_transparent(true)
             .with_inner_size([1100., 820.])
             .with_min_inner_size([760., 600.]),
         ..Default::default()

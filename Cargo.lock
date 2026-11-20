@@ -1018,8 +1018,6 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
- "zune-core",
- "zune-jpeg",
 ]
 
 [[package]]
@@ -2282,7 +2280,6 @@ dependencies = [
  "chrono",
  "dirs",
  "eframe",
- "image",
  "rusqlite",
  "sysinfo",
 ]
